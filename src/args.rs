@@ -6,6 +6,23 @@ use crate::auth::check_auth_args;
 use crate::error::AppError;
 use crate::utils::check_port_is_available;
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub(crate) enum DatabaseType {
+    Sqlite,
+    Mysql,
+    Postgresql,
+}
+
+impl std::fmt::Display for DatabaseType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DatabaseType::Sqlite => write!(f, "sqlite"),
+            DatabaseType::Mysql => write!(f, "mysql"),
+            DatabaseType::Postgresql => write!(f, "postgresql"),
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -35,6 +52,14 @@ struct Args {
     /// Disable authentication
     #[arg(long, default_value_t = false)]
     disable_authentication: bool,
+
+    /// Database type: sqlite, mysql, postgresql
+    #[arg(long, default_value_t = DatabaseType::Sqlite)]
+    database_type: DatabaseType,
+
+    /// Database URL (required for mysql/postgresql)
+    #[arg(long)]
+    database_url: Option<String>,
 }
 
 pub(crate) struct UserArgs {
@@ -44,6 +69,8 @@ pub(crate) struct UserArgs {
     pub(crate) network: BitcoinNetwork,
     pub(crate) max_media_upload_size_mb: u16,
     pub(crate) root_public_key: Option<biscuit_auth::PublicKey>,
+    pub(crate) database_type: DatabaseType,
+    pub(crate) database_url: Option<String>,
 }
 
 pub(crate) fn parse_startup_args() -> Result<UserArgs, AppError> {
@@ -65,5 +92,7 @@ pub(crate) fn parse_startup_args() -> Result<UserArgs, AppError> {
         network,
         max_media_upload_size_mb: args.max_media_upload_size_mb,
         root_public_key,
+        database_type: args.database_type,
+        database_url: args.database_url,
     })
 }

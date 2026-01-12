@@ -19,6 +19,7 @@ use lightning::{
 use lightning_persister::fs_store::FilesystemStore;
 use magic_crypt::{new_magic_crypt, MagicCryptTrait};
 use rgb_lib::{bdk_wallet::keys::bip39::Mnemonic, BitcoinNetwork, ContractId};
+use sea_orm::DatabaseConnection;
 use std::{
     collections::HashSet,
     fmt::Write,
@@ -37,7 +38,7 @@ use crate::ldk::{ChannelIdsMap, Router};
 use crate::rgb::{get_rgb_channel_info_optional, RgbLibWalletWrapper};
 use crate::routes::{DEFAULT_FINAL_CLTV_EXPIRY_DELTA, HTLC_MIN_MSAT};
 use crate::{
-    args::UserArgs,
+    args::{DatabaseType, UserArgs},
     disk::FilesystemLogger,
     error::{APIError, AppError},
     ldk::{
@@ -93,6 +94,7 @@ pub(crate) struct StaticState {
     pub(crate) ldk_data_dir: PathBuf,
     pub(crate) logger: Arc<FilesystemLogger>,
     pub(crate) max_media_upload_size_mb: u16,
+    pub(crate) db: DatabaseConnection,
 }
 
 pub(crate) struct UnlockedAppState {
@@ -358,12 +360,39 @@ pub(crate) fn parse_peer_info(
     Ok((pubkey.unwrap(), peer_addr))
 }
 
+fn get_database_url(
+    db_type: &DatabaseType,
+    db_url: Option<&str>,
+    storage_dir: &Path,
+) -> Result<String, AppError> {
+    match db_type {
+        DatabaseType::Sqlite => {
+            let db_path = storage_dir.join("db.sqlite");
+            Ok(format!("sqlite://{}?mode=rwc", db_path.display()))
+        }
+        DatabaseType::Mysql | DatabaseType::Postgresql => db_url
+            .ok_or(AppError::ConfigError(
+                "Database URL required for mysql/postgresql".to_string(),
+            ))
+            .map(|s| s.to_string()),
+    }
+}
+
 pub(crate) async fn start_daemon(args: &UserArgs) -> Result<Arc<AppState>, AppError> {
     // Initialize the Logger (creates ldk_data_dir and its logs directory)
     let ldk_data_dir = args.storage_dir_path.join(LDK_DIR);
     let logger = Arc::new(FilesystemLogger::new(ldk_data_dir.clone()));
 
     let cancel_token = CancellationToken::new();
+
+    let database_url = get_database_url(
+        &args.database_type,
+        args.database_url.as_deref(),
+        &args.storage_dir_path,
+    )?;
+    let db = sea_orm::Database::connect(&database_url)
+        .await
+        .map_err(|e| AppError::DatabaseConnection(format!("Failed to connect: {}", e)))?;
 
     let static_state = Arc::new(StaticState {
         ldk_peer_listening_port: args.ldk_peer_listening_port,
@@ -372,6 +401,7 @@ pub(crate) async fn start_daemon(args: &UserArgs) -> Result<Arc<AppState>, AppEr
         ldk_data_dir,
         logger,
         max_media_upload_size_mb: args.max_media_upload_size_mb,
+        db,
     });
 
     let app_state = Arc::new(AppState {

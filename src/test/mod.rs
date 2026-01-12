@@ -17,6 +17,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tracing_test::traced_test;
 
+use crate::args::DatabaseType;
 use crate::error::APIErrorResponse;
 use crate::ldk::FEE_RATE;
 use crate::routes::{
@@ -67,6 +68,8 @@ impl Default for UserArgs {
             ldk_peer_listening_port: 9735,
             max_media_upload_size_mb: 3,
             root_public_key: None,
+            database_type: DatabaseType::Sqlite,
+            database_url: None,
         }
     }
 }
@@ -1860,6 +1863,7 @@ mod close_force_other_side;
 mod close_force_standard;
 mod concurrent_btc_payments;
 mod concurrent_openchannel;
+mod database_connection;
 mod fail_transfers;
 mod getchannelid;
 mod hodl_invoice;

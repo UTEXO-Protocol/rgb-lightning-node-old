@@ -551,6 +551,9 @@ impl IntoResponse for APIError {
 /// The error variants returned by the app
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
+
     #[error("The provided authentication args are invalid")]
     InvalidAuthenticationArgs,
 
@@ -565,4 +568,7 @@ pub enum AppError {
 
     #[error("Port {0} is unavailable")]
     UnavailablePort(u16),
+
+    #[error("Database connection error: {0}")]
+    DatabaseConnection(String),
 }
