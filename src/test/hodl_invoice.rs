@@ -199,6 +199,40 @@ async fn invoice_cancel_expect_error(
     .await;
 }
 
+async fn invoice_cancel_expect_settling_or_settled(node_address: SocketAddr, payment_hash: String) {
+    println!("cancelling HODL invoice {payment_hash} on node {node_address}");
+    let payload = InvoiceCancelRequest { payment_hash };
+    let res = reqwest::Client::new()
+        .post(format!("http://{node_address}/invoice/cancel"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+
+    // Racy by nature: if settlement completes first, we see 409 instead of 403.
+    if res.status() == StatusCode::FORBIDDEN {
+        check_response_is_nok(
+            res,
+            StatusCode::FORBIDDEN,
+            "Invoice settlement is in progress",
+            "InvoiceSettlingInProgress",
+        )
+        .await;
+    } else if res.status() == StatusCode::CONFLICT {
+        check_response_is_nok(
+            res,
+            StatusCode::CONFLICT,
+            "Invoice is already settled",
+            "InvoiceAlreadySettled",
+        )
+        .await;
+    } else {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        panic!("expected 403 settling-in-progress or 409 already settled, got {status}: {body}");
+    }
+}
+
 fn expect_api_ok<T>(result: Result<T, APIError>, context: &str) -> T {
     match result {
         Ok(value) => value,
@@ -793,14 +827,8 @@ async fn cancel_while_settling_fails() {
         "claimable entry should be marked settling",
     );
 
-    invoice_cancel_expect_error(
-        node2_addr,
-        payment_hash_hex.clone(),
-        StatusCode::FORBIDDEN,
-        "Invoice settlement is in progress",
-        "InvoiceSettlingInProgress",
-    )
-    .await;
+    // Prefer the settling-in-progress error; accept already-settled if the race completes first.
+    invoice_cancel_expect_settling_or_settled(node2_addr, payment_hash_hex.clone()).await;
 
     let payee_payment =
         wait_for_ln_payment(node2_addr, &decoded.payment_hash, HTLCStatus::Succeeded).await;
