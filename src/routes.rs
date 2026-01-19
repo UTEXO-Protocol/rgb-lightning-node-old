@@ -78,7 +78,7 @@ use crate::ldk::{start_ldk, stop_ldk, LdkBackgroundServices, MIN_CHANNEL_CONFIRM
 use crate::swap::{SwapData, SwapInfo, SwapString};
 use crate::utils::{
     check_already_initialized, check_channel_id, check_password_strength, check_password_validity,
-    encrypt_and_save_mnemonic, get_max_local_rgb_amount, get_mnemonic_path, get_route, hex_str,
+    encrypt_and_save_mnemonic, get_max_local_rgb_amount, get_route, hex_str,
     hex_str_to_compressed_pubkey, hex_str_to_vec, UnlockedAppState, UserOnionMessageContents,
 };
 use crate::{
@@ -1259,9 +1259,11 @@ pub(crate) async fn address(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<AddressResponse>, APIError> {
     let guard = state.check_unlocked().await?;
-    let unlocked_state = guard.as_ref().unwrap();
+    let unlocked_state = Arc::clone(guard.as_ref().unwrap());
 
-    let address = unlocked_state.rgb_get_address()?;
+    let address = tokio::task::spawn_blocking(move || unlocked_state.rgb_get_address())
+        .await
+        .unwrap()?;
 
     Ok(Json(AddressResponse { address }))
 }
@@ -1271,12 +1273,18 @@ pub(crate) async fn asset_balance(
     WithRejection(Json(payload), _): WithRejection<Json<AssetBalanceRequest>, APIError>,
 ) -> Result<Json<AssetBalanceResponse>, APIError> {
     let guard = state.check_unlocked().await?;
-    let unlocked_state = guard.as_ref().unwrap();
+    let unlocked_state = Arc::clone(guard.as_ref().unwrap());
 
     let contract_id = ContractId::from_str(&payload.asset_id)
         .map_err(|_| APIError::InvalidAssetID(payload.asset_id))?;
 
-    let balance = unlocked_state.rgb_get_asset_balance(contract_id)?;
+    let unlocked_state_clone = Arc::clone(&unlocked_state);
+    let balance = tokio::task::spawn_blocking(move || {
+        unlocked_state_clone.rgb_get_asset_balance(contract_id)
+    })
+    .await
+    .unwrap()
+    .map_err(|e| APIError::FailedBroadcast(format!("Asset balance retrieval failed: {e}")))?;
 
     let mut offchain_outbound = 0;
     let mut offchain_inbound = 0;
@@ -1341,7 +1349,8 @@ pub(crate) async fn backup(
         let _guard = state.check_locked().await?;
 
         let _mnemonic =
-            check_password_validity(&payload.password, &state.static_state.storage_dir_path)?;
+            check_password_validity(&payload.password, &state.static_state.database_manager)
+                .await?;
 
         do_backup(
             &state.static_state.storage_dir_path,
@@ -1388,13 +1397,15 @@ pub(crate) async fn change_password(
         check_password_strength(payload.new_password.clone())?;
 
         let mnemonic =
-            check_password_validity(&payload.old_password, &state.static_state.storage_dir_path)?;
+            check_password_validity(&payload.old_password, &state.static_state.database_manager)
+                .await?;
 
         encrypt_and_save_mnemonic(
             payload.new_password,
             mnemonic.to_string(),
-            &get_mnemonic_path(&state.static_state.storage_dir_path),
-        )?;
+            &state.static_state.database_manager,
+        )
+        .await?;
 
         Ok(Json(EmptyResponse {}))
     })
@@ -1531,15 +1542,19 @@ pub(crate) async fn create_utxos(
 ) -> Result<Json<EmptyResponse>, APIError> {
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
-
-        unlocked_state.rgb_create_utxos(
-            payload.up_to,
-            payload.num.unwrap_or(UTXO_NUM),
-            payload.size.unwrap_or(UTXO_SIZE_SAT),
-            payload.fee_rate,
-            payload.skip_sync,
-        )?;
+        let unlocked_state = Arc::clone(guard.as_ref().unwrap());
+        tokio::task::spawn_blocking(move || {
+            unlocked_state.rgb_create_utxos(
+                payload.up_to,
+                payload.num.unwrap_or(UTXO_NUM),
+                payload.size.unwrap_or(UTXO_SIZE_SAT),
+                payload.fee_rate,
+                payload.skip_sync,
+            )
+        })
+        .await
+        .unwrap()
+        .map_err(|e| APIError::FailedBroadcast(format!("UTXO creation failed: {e}")))?;
         tracing::debug!("UTXO creation complete");
 
         Ok(Json(EmptyResponse {}))
@@ -1724,14 +1739,18 @@ pub(crate) async fn init(
 
         check_password_strength(payload.password.clone())?;
 
-        let mnemonic_path = get_mnemonic_path(&state.static_state.storage_dir_path);
-        check_already_initialized(&mnemonic_path)?;
+        check_already_initialized(&state.static_state.database_manager).await?;
 
         let keys = generate_keys(state.static_state.network);
 
         let mnemonic = keys.mnemonic;
 
-        encrypt_and_save_mnemonic(payload.password, mnemonic.clone(), &mnemonic_path)?;
+        encrypt_and_save_mnemonic(
+            payload.password,
+            mnemonic.clone(),
+            &state.static_state.database_manager,
+        )
+        .await?;
 
         Ok(Json(InitResponse { mnemonic }))
     })
@@ -1805,18 +1824,23 @@ pub(crate) async fn issue_asset_nia(
 ) -> Result<Json<IssueAssetNIAResponse>, APIError> {
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
+        let unlocked_state = Arc::clone(guard.as_ref().unwrap());
 
         if *unlocked_state.rgb_send_lock.lock().unwrap() {
             return Err(APIError::OpenChannelInProgress);
         }
 
-        let asset = unlocked_state.rgb_issue_asset_nia(
-            payload.ticker,
-            payload.name,
-            payload.precision,
-            payload.amounts,
-        )?;
+        let asset = tokio::task::spawn_blocking(move || {
+            unlocked_state.rgb_issue_asset_nia(
+                payload.ticker,
+                payload.name,
+                payload.precision,
+                payload.amounts,
+            )
+        })
+        .await
+        .unwrap()
+        .map_err(|e| APIError::FailedBroadcast(format!("Asset issuance failed: {e}")))?;
 
         Ok(Json(IssueAssetNIAResponse {
             asset: asset.into(),
@@ -3283,8 +3307,7 @@ pub(crate) async fn restore(
     no_cancel(async move {
         let _unlocked_state = state.check_locked().await?;
 
-        let mnemonic_path = get_mnemonic_path(&state.static_state.storage_dir_path);
-        check_already_initialized(&mnemonic_path)?;
+        check_already_initialized(&state.static_state.database_manager).await?;
 
         restore_backup(
             Path::new(&payload.backup_path),
@@ -3293,7 +3316,8 @@ pub(crate) async fn restore(
         )?;
 
         let _mnemonic =
-            check_password_validity(&payload.password, &state.static_state.storage_dir_path)?;
+            check_password_validity(&payload.password, &state.static_state.database_manager)
+                .await?;
 
         Ok(Json(EmptyResponse {}))
     })
@@ -3752,16 +3776,16 @@ pub(crate) async fn unlock(
             }
         }
 
-        let mnemonic = match check_password_validity(
-            &payload.password,
-            &state.static_state.storage_dir_path,
-        ) {
-            Ok(mnemonic) => mnemonic,
-            Err(e) => {
-                state.update_changing_state(false);
-                return Err(e);
-            }
-        };
+        let mnemonic =
+            match check_password_validity(&payload.password, &state.static_state.database_manager)
+                .await
+            {
+                Ok(mnemonic) => mnemonic,
+                Err(e) => {
+                    state.update_changing_state(false);
+                    return Err(e);
+                }
+            };
 
         tracing::debug!("Starting LDK...");
         let (new_ldk_background_services, new_unlocked_app_state) =

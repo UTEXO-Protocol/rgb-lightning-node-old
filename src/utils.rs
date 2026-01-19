@@ -19,7 +19,6 @@ use rgb_lib::{bdk_wallet::keys::bip39::Mnemonic, BitcoinNetwork, ContractId};
 use std::{
     collections::HashSet,
     fmt::Write,
-    fs,
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     path::Path,
     path::PathBuf,
@@ -90,6 +89,7 @@ pub(crate) struct StaticState {
     pub(crate) ldk_data_dir: PathBuf,
     pub(crate) logger: Arc<FilesystemLogger>,
     pub(crate) max_media_upload_size_mb: u16,
+    pub(crate) database_manager: Arc<crate::database::DatabaseManager>,
 }
 
 pub(crate) struct UnlockedAppState {
@@ -156,8 +156,10 @@ impl Writeable for UserOnionMessageContents {
     }
 }
 
-pub(crate) fn check_already_initialized(mnemonic_path: &Path) -> Result<(), APIError> {
-    if mnemonic_path.exists() {
+pub(crate) async fn check_already_initialized(
+    database_manager: &crate::database::DatabaseManager,
+) -> Result<(), APIError> {
+    if database_manager.check_already_initialized().await? {
         return Err(APIError::AlreadyInitialized);
     }
     Ok(())
@@ -172,20 +174,16 @@ pub(crate) fn check_password_strength(password: String) -> Result<(), APIError> 
     Ok(())
 }
 
-pub(crate) fn check_password_validity(
+pub(crate) async fn check_password_validity(
     password: &str,
-    storage_dir_path: &Path,
+    database_manager: &crate::database::DatabaseManager,
 ) -> Result<Mnemonic, APIError> {
-    let mnemonic_path = get_mnemonic_path(storage_dir_path);
-    if let Ok(encrypted_mnemonic) = fs::read_to_string(mnemonic_path) {
-        let mcrypt = new_magic_crypt!(password, 256);
-        let mnemonic_str = mcrypt
-            .decrypt_base64_to_string(encrypted_mnemonic)
-            .map_err(|_| APIError::WrongPassword)?;
-        Ok(Mnemonic::from_str(&mnemonic_str).expect("valid mnemonic"))
-    } else {
-        Err(APIError::NotInitialized)
-    }
+    let encrypted_mnemonic = database_manager.load_mnemonic().await?;
+    let mcrypt = new_magic_crypt!(password, 256);
+    let mnemonic_str = mcrypt
+        .decrypt_base64_to_string(encrypted_mnemonic)
+        .map_err(|_| APIError::WrongPassword)?;
+    Ok(Mnemonic::from_str(&mnemonic_str).expect("valid mnemonic"))
 }
 
 pub(crate) fn check_channel_id(channel_id_str: &str) -> Result<ChannelId, APIError> {
@@ -206,27 +204,16 @@ pub(crate) fn check_port_is_available(port: u16) -> Result<(), AppError> {
     Ok(())
 }
 
-pub(crate) fn get_mnemonic_path(storage_dir_path: &Path) -> PathBuf {
-    storage_dir_path.join("mnemonic")
-}
-
-pub(crate) fn encrypt_and_save_mnemonic(
+pub(crate) async fn encrypt_and_save_mnemonic(
     password: String,
     mnemonic: String,
-    mnemonic_path: &Path,
+    database_manager: &crate::database::DatabaseManager,
 ) -> Result<(), APIError> {
     let mcrypt = new_magic_crypt!(password, 256);
     let encrypted_mnemonic = mcrypt.encrypt_str_to_base64(mnemonic);
-    match fs::write(mnemonic_path, encrypted_mnemonic) {
-        Ok(()) => {
-            tracing::info!("Created a new wallet");
-            Ok(())
-        }
-        Err(e) => Err(APIError::FailedKeysCreation(
-            mnemonic_path.to_string_lossy().to_string(),
-            e.to_string(),
-        )),
-    }
+    database_manager.save_mnemonic(encrypted_mnemonic).await?;
+    tracing::info!("Created a new wallet");
+    Ok(())
 }
 
 pub(crate) async fn connect_peer_if_necessary(
@@ -352,6 +339,9 @@ pub(crate) async fn start_daemon(args: &UserArgs) -> Result<Arc<AppState>, AppEr
 
     let cancel_token = CancellationToken::new();
 
+    let db_path = args.storage_dir_path.join("rln_db");
+    let database_manager = Arc::new(crate::database::DatabaseManager::new(&db_path).await?);
+
     let static_state = Arc::new(StaticState {
         ldk_peer_listening_port: args.ldk_peer_listening_port,
         network: args.network,
@@ -359,6 +349,7 @@ pub(crate) async fn start_daemon(args: &UserArgs) -> Result<Arc<AppState>, AppEr
         ldk_data_dir,
         logger,
         max_media_upload_size_mb: args.max_media_upload_size_mb,
+        database_manager,
     });
 
     let app_state = Arc::new(AppState {

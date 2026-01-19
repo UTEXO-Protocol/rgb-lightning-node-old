@@ -1502,6 +1502,10 @@ pub(crate) async fn start_ldk(
     mnemonic: Mnemonic,
     unlock_request: UnlockRequest,
 ) -> Result<(LdkBackgroundServices, Arc<UnlockedAppState>), APIError> {
+    tracing::info!(
+        "Starting LDK with network: {:?}",
+        app_state.static_state.network
+    );
     let static_state = &app_state.static_state;
 
     let ldk_data_dir = static_state.ldk_data_dir.clone();
@@ -1512,6 +1516,7 @@ pub(crate) async fn start_ldk(
     let ldk_peer_listening_port = static_state.ldk_peer_listening_port;
 
     // Initialize our bitcoind client.
+    tracing::info!("Initializing bitcoind client");
     let bitcoind_client = match BitcoindClient::new(
         unlock_request.bitcoind_rpc_host.clone(),
         unlock_request.bitcoind_rpc_port,
@@ -1522,13 +1527,18 @@ pub(crate) async fn start_ldk(
     )
     .await
     {
-        Ok(client) => Arc::new(client),
+        Ok(client) => {
+            tracing::info!("Bitcoind client initialized successfully");
+            Arc::new(client)
+        }
         Err(e) => {
+            tracing::error!("Failed to initialize bitcoind client: {}", e);
             return Err(APIError::FailedBitcoindConnection(e.to_string()));
         }
     };
 
     // Check that the bitcoind we've connected to is running the network we expect
+    tracing::info!("Checking bitcoind network");
     let bitcoind_chain = bitcoind_client.get_blockchain_info().await.chain;
     if bitcoind_chain
         != match bitcoin_network {
@@ -1541,6 +1551,7 @@ pub(crate) async fn start_ldk(
     {
         return Err(APIError::NetworkMismatch(bitcoind_chain, bitcoin_network));
     }
+    tracing::info!("Bitcoind network check passed");
 
     // RGB setup
     let indexer_url = if let Some(indexer_url) = &unlock_request.indexer_url {
@@ -1742,13 +1753,15 @@ pub(crate) async fn start_ldk(
         get_account_data(bitcoin_network, &mnemonic_str, false).unwrap();
     let (_, account_xpub_colored, master_fingerprint) =
         get_account_data(bitcoin_network, &mnemonic_str, true).unwrap();
+    tracing::info!("Creating RGB wallet and going online");
     let data_dir = static_state
         .storage_dir_path
         .clone()
         .to_string_lossy()
         .to_string();
-    let mut rgb_wallet = tokio::task::spawn_blocking(move || {
-        RgbLibWallet::new(WalletData {
+    let indexer_url_clone = indexer_url.to_string();
+    let spawn_result = tokio::task::spawn_blocking(move || {
+        let mut wallet = RgbLibWallet::new(WalletData {
             data_dir,
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
@@ -1760,11 +1773,15 @@ pub(crate) async fn start_ldk(
             vanilla_keychain: None,
             supported_schemas: vec![AssetSchema::Nia, AssetSchema::Cfa, AssetSchema::Uda],
         })
-        .expect("valid rgb-lib wallet")
+        .expect("valid rgb-lib wallet");
+        let online = wallet.go_online(false, indexer_url_clone)?;
+        Ok((wallet, online))
     })
     .await
-    .unwrap();
-    let rgb_online = rgb_wallet.go_online(false, indexer_url.to_string())?;
+    .map_err(|e| APIError::Unexpected(format!("Join error: {}", e)))?;
+    let (rgb_wallet, rgb_online) = spawn_result
+        .map_err(|e: rgb_lib::Error| APIError::Unexpected(format!("RGB wallet error: {}", e)))?;
+    tracing::info!("RGB wallet created and online");
     fs::write(
         static_state.storage_dir_path.join(WALLET_FINGERPRINT_FNAME),
         account_xpub_colored.fingerprint().to_string(),
@@ -2229,6 +2246,7 @@ pub(crate) async fn start_ldk(
 
     tracing::info!("LDK logs are available at <your-supplied-ldk-data-dir-path>/.ldk/logs");
     tracing::info!("Local Node ID is {}", channel_manager.get_our_node_id());
+    tracing::info!("LDK started successfully");
 
     Ok((
         LdkBackgroundServices {
