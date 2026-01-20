@@ -1,19 +1,15 @@
-use bitcoin::secp256k1::PublicKey;
 use bitcoin::Network;
 use chrono::Utc;
 use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringDecayParameters};
 use lightning::util::hash_tables::new_hash_map;
 use lightning::util::logger::{Logger, Record};
 use lightning::util::ser::{Readable, ReadableArgs, Writer};
-use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::BufReader;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::error::APIError;
 use crate::ldk::{
     ChannelIdsMap, InboundPaymentInfoStorage, NetworkGraph, OutboundPaymentInfoStorage,
     OutputSpenderTxes, SwapMap,
@@ -69,27 +65,6 @@ impl Logger for FilesystemLogger {
             .write_all(log.as_bytes())
             .unwrap();
     }
-}
-
-pub(crate) async fn persist_channel_peer(
-    database_manager: &crate::database::DatabaseManager,
-    pubkey: &PublicKey,
-    address: &SocketAddr,
-) -> Result<(), APIError> {
-    database_manager.save_channel_peer(pubkey, address).await
-}
-
-pub(crate) async fn delete_channel_peer(
-    database_manager: &crate::database::DatabaseManager,
-    pubkey: &PublicKey,
-) -> Result<(), APIError> {
-    database_manager.delete_channel_peer(pubkey).await
-}
-
-pub(crate) async fn read_channel_peer_data(
-    database_manager: &crate::database::DatabaseManager,
-) -> Result<HashMap<PublicKey, SocketAddr>, APIError> {
-    database_manager.load_channel_peers().await
 }
 
 pub(crate) fn read_network(

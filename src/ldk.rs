@@ -2241,7 +2241,7 @@ pub(crate) async fn start_ldk(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            match disk::read_channel_peer_data(&database_manager).await {
+            match database_manager.load_channel_peers().await {
                 Ok(info) => {
                     for node_id in connect_cm
                         .list_channels()

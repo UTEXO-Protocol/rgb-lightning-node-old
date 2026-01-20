@@ -86,7 +86,6 @@ use crate::{
     rgb::{check_rgb_proxy_endpoint, get_rgb_channel_info_optional},
 };
 use crate::{
-    disk,
     error::APIError,
     ldk::{PaymentInfo, FEE_RATE, UTXO_SIZE_SAT},
     utils::{
@@ -1521,12 +1520,11 @@ pub(crate) async fn connect_peer(
         if let Some(peer_addr) = peer_addr {
             connect_peer_if_necessary(peer_pubkey, peer_addr, unlocked_state.peer_manager.clone())
                 .await?;
-            disk::persist_channel_peer(
-                &state.static_state.database_manager,
-                &peer_pubkey,
-                &peer_addr,
-            )
-            .await?;
+            state
+                .static_state
+                .database_manager
+                .save_channel_peer(&peer_pubkey, &peer_addr)
+                .await?;
         } else {
             return Err(APIError::InvalidPeerInfo(s!(
                 "incorrectly formatted peer info. Should be formatted as: `pubkey@host:port`"
@@ -1631,7 +1629,11 @@ pub(crate) async fn disconnect_peer(
             }
         }
 
-        disk::delete_channel_peer(&state.static_state.database_manager, &peer_pubkey).await?;
+        state
+            .static_state
+            .database_manager
+            .delete_channel_peer(&peer_pubkey)
+            .await?;
 
         //check the pubkey matches a valid connected peer
         if unlocked_state
@@ -3068,8 +3070,11 @@ pub(crate) async fn open_channel(
             }
         }
         if peer_addr.is_none() {
-            let peer_info =
-                disk::read_channel_peer_data(&state.static_state.database_manager).await?;
+            let peer_info = state
+                .static_state
+                .database_manager
+                .load_channel_peers()
+                .await?;
             for (pubkey, addr) in peer_info.into_iter() {
                 if pubkey == peer_pubkey {
                     peer_addr = Some(addr);
@@ -3080,12 +3085,11 @@ pub(crate) async fn open_channel(
         if let Some(peer_addr) = peer_addr {
             connect_peer_if_necessary(peer_pubkey, peer_addr, unlocked_state.peer_manager.clone())
                 .await?;
-            disk::persist_channel_peer(
-                &state.static_state.database_manager,
-                &peer_pubkey,
-                &peer_addr,
-            )
-            .await?;
+            state
+                .static_state
+                .database_manager
+                .save_channel_peer(&peer_pubkey, &peer_addr)
+                .await?;
         } else {
             return Err(APIError::InvalidPeerInfo(s!(
                 "cannot find the address for the provided pubkey"
