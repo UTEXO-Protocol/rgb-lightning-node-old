@@ -90,11 +90,12 @@ use time::OffsetDateTime;
 use tokio::runtime::Handle;
 use tokio::sync::watch::Sender;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 use crate::bitcoind::BitcoindClient;
 use crate::disk::{
-    self, FilesystemLogger, CHANNEL_IDS_FNAME, CHANNEL_PEER_DATA, INBOUND_PAYMENTS_FNAME,
-    MAKER_SWAPS_FNAME, OUTBOUND_PAYMENTS_FNAME, OUTPUT_SPENDER_TXES, TAKER_SWAPS_FNAME,
+    self, FilesystemLogger, CHANNEL_IDS_FNAME, INBOUND_PAYMENTS_FNAME, MAKER_SWAPS_FNAME,
+    OUTBOUND_PAYMENTS_FNAME, OUTPUT_SPENDER_TXES, TAKER_SWAPS_FNAME,
 };
 use crate::error::APIError;
 use crate::rgb::{check_rgb_proxy_endpoint, get_rgb_channel_info_optional, RgbLibWalletWrapper};
@@ -582,12 +583,21 @@ async fn handle_ldk_events(
                 }]};
 
                 let unlocked_state_copy = unlocked_state.clone();
-                let unsigned_psbt = tokio::task::spawn_blocking(move || {
-                    unlocked_state_copy
-                        .rgb_send_begin(recipient_map, true, FEE_RATE, MIN_CHANNEL_CONFIRMATIONS)
-                        .unwrap()
-                })
+                let unsigned_psbt = timeout(
+                    std::time::Duration::from_secs(30),
+                    tokio::task::spawn_blocking(move || {
+                        unlocked_state_copy
+                            .rgb_send_begin(
+                                recipient_map,
+                                true,
+                                FEE_RATE,
+                                MIN_CHANNEL_CONFIRMATIONS,
+                            )
+                            .unwrap()
+                    }),
+                )
                 .await
+                .unwrap_or_else(|_| panic!("rgb_send_begin timed out"))
                 .unwrap();
                 (unsigned_psbt, Some(asset_id))
             } else {
@@ -597,7 +607,16 @@ async fn handle_ldk_events(
                 (unsigned_psbt, None)
             };
 
-            let signed_psbt = unlocked_state.rgb_sign_psbt(unsigned_psbt).unwrap();
+            let unlocked_state_copy = unlocked_state.clone();
+            let signed_psbt = timeout(
+                std::time::Duration::from_secs(30),
+                tokio::task::spawn_blocking(move || {
+                    unlocked_state_copy.rgb_sign_psbt(unsigned_psbt).unwrap()
+                }),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("rgb_sign_psbt timed out"))
+            .unwrap();
             let psbt = Psbt::from_str(&signed_psbt).unwrap();
 
             let funding_tx = psbt.clone().extract_tx().unwrap();
@@ -607,39 +626,59 @@ async fn handle_ldk_events(
             let psbt_path = static_state
                 .ldk_data_dir
                 .join(format!("psbt_{funding_txid}"));
-            fs::write(psbt_path, psbt.to_string()).unwrap();
+            timeout(
+                std::time::Duration::from_secs(10),
+                tokio::task::spawn_blocking(move || {
+                    fs::write(psbt_path, psbt.to_string()).unwrap();
+                }),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("PSBT file write timed out"))
+            .unwrap();
 
             if let Some(asset_id) = asset_id {
-                let unlocked_state_copy = unlocked_state.clone();
-                let witness_id = funding_txid.clone();
-                tokio::task::spawn_blocking(move || {
-                    unlocked_state_copy
-                        .rgb_upsert_witness(
-                            RgbTxid::from_str(&witness_id).unwrap(),
-                            WitnessOrd::Tentative,
-                        )
-                        .unwrap()
-                })
-                .await
-                .unwrap();
-
                 let consignment_path =
                     unlocked_state.rgb_get_send_consignment_path(&asset_id, &funding_txid);
                 let proxy_url = TransportEndpoint::new(unlocked_state.proxy_endpoint.clone())
                     .unwrap()
                     .endpoint;
                 let unlocked_state_copy = unlocked_state.clone();
-                let res = tokio::task::spawn_blocking(move || {
-                    unlocked_state_copy.rgb_post_consignment(
-                        &proxy_url,
-                        funding_txid.clone(),
-                        &consignment_path,
-                        funding_txid,
-                        None,
-                    )
-                })
-                .await
-                .unwrap();
+                let witness_id = funding_txid.clone();
+                let funding_txid_clone = funding_txid.clone();
+
+                let rgb_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    tokio::task::spawn_blocking(move || {
+                        // rgb_upsert_witness
+                        unlocked_state_copy
+                            .rgb_upsert_witness(
+                                RgbTxid::from_str(&witness_id).unwrap(),
+                                WitnessOrd::Tentative,
+                            )
+                            .unwrap();
+
+                        unlocked_state_copy.rgb_post_consignment(
+                            &proxy_url,
+                            funding_txid_clone.clone(),
+                            &consignment_path,
+                            funding_txid_clone,
+                            None,
+                        )
+                    }),
+                )
+                .await;
+
+                let res = match rgb_result {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(join_err)) => {
+                        tracing::error!("RGB spawn_blocking task failed: {}", join_err);
+                        return Err(ReplayEvent());
+                    }
+                    Err(_) => {
+                        tracing::error!("RGB operation timed out after 30 seconds");
+                        return Err(ReplayEvent());
+                    }
+                };
 
                 if let Err(e) = res {
                     tracing::error!("cannot post consignment: {e}");
@@ -650,6 +689,10 @@ async fn handle_ldk_events(
             let channel_manager_copy = unlocked_state.channel_manager.clone();
 
             // Give the funding transaction back to LDK for opening the channel.
+            tracing::info!(
+                "Calling funding_transaction_generated for channel {}",
+                temporary_channel_id
+            );
             if channel_manager_copy
                 .funding_transaction_generated(
                     temporary_channel_id,
@@ -752,7 +795,11 @@ async fn handle_ldk_events(
                 }
             }
 
-            _update_rgb_channel_amount(&static_state.ldk_data_dir, &payment_hash, true);
+            tokio::task::spawn_blocking(move || {
+                _update_rgb_channel_amount(&static_state.ldk_data_dir, &payment_hash, true);
+            })
+            .await
+            .unwrap();
             if is_maker_swap {
                 unlocked_state.update_maker_swap_status(&payment_hash, SwapStatus::Succeeded);
             } else {
@@ -773,7 +820,11 @@ async fn handle_ldk_events(
             payment_id,
             ..
         } => {
-            _update_rgb_channel_amount(&static_state.ldk_data_dir, &payment_hash, false);
+            tokio::task::spawn_blocking(move || {
+                _update_rgb_channel_amount(&static_state.ldk_data_dir, &payment_hash, false);
+            })
+            .await
+            .unwrap();
 
             if unlocked_state.is_maker_swap(&payment_hash) {
                 tracing::info!(
@@ -811,7 +862,8 @@ async fn handle_ldk_events(
             random_bytes
                 .copy_from_slice(&unlocked_state.keys_manager.get_secure_random_bytes()[..16]);
             let user_channel_id = u128::from_be_bytes(random_bytes);
-            let res = unlocked_state.channel_manager.accept_inbound_channel(
+            let channel_manager_copy = unlocked_state.channel_manager.clone();
+            let res = channel_manager_copy.accept_inbound_channel(
                 temporary_channel_id,
                 counterparty_node_id,
                 user_channel_id,
@@ -916,71 +968,86 @@ async fn handle_ldk_events(
                 unlocked_state.update_taker_swap_status(&payment_hash, SwapStatus::Succeeded);
             }
 
-            let read_only_network_graph = unlocked_state.network_graph.read_only();
-            let nodes = read_only_network_graph.nodes();
-            let channels = unlocked_state.channel_manager.list_channels();
+            let network_graph_copy = unlocked_state.network_graph.clone();
+            let channel_manager_copy = unlocked_state.channel_manager.clone();
+            let prev_channel_id_copy = prev_channel_id;
+            let next_channel_id_copy = next_channel_id;
+            let claim_from_onchain_tx_copy = claim_from_onchain_tx;
+            let outbound_amount_forwarded_msat_copy = outbound_amount_forwarded_msat;
+            let total_fee_earned_msat_copy = total_fee_earned_msat;
 
-            let node_str = |channel_id: &Option<ChannelId>| match channel_id {
-                None => String::new(),
-                Some(channel_id) => match channels.iter().find(|c| c.channel_id == *channel_id) {
+            tokio::task::spawn_blocking(move || {
+                let read_only_network_graph = network_graph_copy.read_only();
+                let nodes = read_only_network_graph.nodes();
+                let channels = channel_manager_copy.list_channels();
+
+                let node_str = |channel_id: &Option<ChannelId>| match channel_id {
                     None => String::new(),
-                    Some(channel) => {
-                        match nodes.get(&NodeId::from_pubkey(&channel.counterparty.node_id)) {
-                            None => "private node".to_string(),
-                            Some(node) => match &node.announcement_info {
-                                None => "unnamed node".to_string(),
-                                Some(announcement) => {
-                                    format!("node {}", announcement.alias())
-                                }
-                            },
+                    Some(channel_id) => match channels.iter().find(|c| c.channel_id == *channel_id)
+                    {
+                        None => String::new(),
+                        Some(channel) => {
+                            match nodes.get(&NodeId::from_pubkey(&channel.counterparty.node_id)) {
+                                None => "private node".to_string(),
+                                Some(node) => match &node.announcement_info {
+                                    None => "unnamed node".to_string(),
+                                    Some(announcement) => {
+                                        format!("node {}", announcement.alias())
+                                    }
+                                },
+                            }
                         }
-                    }
-                },
-            };
-            let channel_str = |channel_id: &Option<ChannelId>| {
-                channel_id
-                    .map(|channel_id| format!(" with channel {channel_id}"))
-                    .unwrap_or_default()
-            };
-            let from_prev_str = format!(
-                " from {}{}",
-                node_str(&prev_channel_id),
-                channel_str(&prev_channel_id)
-            );
-            let to_next_str = format!(
-                " to {}{}",
-                node_str(&next_channel_id),
-                channel_str(&next_channel_id)
-            );
+                    },
+                };
+                let channel_str = |channel_id: &Option<ChannelId>| {
+                    channel_id
+                        .map(|channel_id| format!(" with channel {channel_id}"))
+                        .unwrap_or_default()
+                };
 
-            let from_onchain_str = if claim_from_onchain_tx {
-                "from onchain downstream claim"
-            } else {
-                "from HTLC fulfill message"
-            };
-            let amt_args = if let Some(v) = outbound_amount_forwarded_msat {
-                format!("{v}")
-            } else {
-                "?".to_string()
-            };
-            if let Some(fee_earned) = total_fee_earned_msat {
-                tracing::info!(
-                    "EVENT: Forwarded payment for {} msat{}{}, earning {} msat {}",
-                    amt_args,
-                    from_prev_str,
-                    to_next_str,
-                    fee_earned,
-                    from_onchain_str
+                let from_prev_str = format!(
+                    " from {}{}",
+                    node_str(&prev_channel_id_copy),
+                    channel_str(&prev_channel_id_copy)
                 );
-            } else {
-                tracing::info!(
-                    "EVENT: Forwarded payment for {} msat{}{}, claiming onchain {}",
-                    amt_args,
-                    from_prev_str,
-                    to_next_str,
-                    from_onchain_str
+                let to_next_str = format!(
+                    " to {}{}",
+                    node_str(&next_channel_id_copy),
+                    channel_str(&next_channel_id_copy)
                 );
-            }
+
+                let from_onchain_str = if claim_from_onchain_tx_copy {
+                    "from onchain downstream claim"
+                } else {
+                    "from HTLC fulfill message"
+                };
+                let amt_args = if let Some(v) = outbound_amount_forwarded_msat_copy {
+                    format!("{v}")
+                } else {
+                    "?".to_string()
+                };
+
+                if let Some(fee_earned) = total_fee_earned_msat_copy {
+                    tracing::info!(
+                        "EVENT: Forwarded payment for {} msat{}{}, earning {} msat {}",
+                        amt_args,
+                        from_prev_str,
+                        to_next_str,
+                        fee_earned,
+                        from_onchain_str
+                    );
+                } else {
+                    tracing::info!(
+                        "EVENT: Forwarded payment for {} msat{}{}, claiming onchain {}",
+                        amt_args,
+                        from_prev_str,
+                        to_next_str,
+                        from_onchain_str
+                    );
+                }
+            })
+            .await
+            .unwrap();
         }
         Event::HTLCHandlingFailed { .. } => {}
         Event::SpendableOutputs {
@@ -1016,7 +1083,12 @@ async fn handle_ldk_events(
                 .join(format!("psbt_{funding_txid}"));
 
             if psbt_path.exists() {
-                let psbt_str = fs::read_to_string(psbt_path).unwrap();
+                let psbt_path_copy = psbt_path.clone();
+                let psbt_str = tokio::task::spawn_blocking(move || {
+                    fs::read_to_string(psbt_path_copy).unwrap()
+                })
+                .await
+                .unwrap();
 
                 let state_copy = unlocked_state.clone();
                 let psbt_str_copy = psbt_str.clone();
@@ -1052,7 +1124,15 @@ async fn handle_ldk_events(
                 let consignment =
                     RgbTransfer::load_file(consignment_path).expect("successful consignment load");
 
-                match unlocked_state.rgb_save_new_asset(consignment, funding_txid) {
+                let unlocked_state_copy = unlocked_state.clone();
+                let consignment_copy = consignment;
+                let funding_txid_copy = funding_txid.clone();
+                match tokio::task::spawn_blocking(move || {
+                    unlocked_state_copy.rgb_save_new_asset(consignment_copy, funding_txid_copy)
+                })
+                .await
+                .unwrap()
+                {
                     Ok(_) => {}
                     Err(e) if e.to_string().contains("UNIQUE constraint failed") => {}
                     Err(e) => panic!("Failed saving asset: {e}"),
@@ -2154,14 +2234,14 @@ pub(crate) async fn start_ldk(
     // Regularly reconnect to channel peers.
     let connect_cm = Arc::clone(&channel_manager);
     let connect_pm = Arc::clone(&peer_manager);
-    let peer_data_path = ldk_data_dir.join(CHANNEL_PEER_DATA);
+    let database_manager = Arc::clone(&static_state.database_manager);
     let stop_connect = Arc::clone(&stop_processing);
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            match disk::read_channel_peer_data(&peer_data_path) {
+            match disk::read_channel_peer_data(&database_manager).await {
                 Ok(info) => {
                     for node_id in connect_cm
                         .list_channels()

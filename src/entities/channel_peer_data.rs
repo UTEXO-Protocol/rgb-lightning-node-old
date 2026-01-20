@@ -4,12 +4,12 @@ use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
-#[sea_orm(table_name = "mnemonic")]
+#[sea_orm(table_name = "channel_peer_data")]
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    #[sea_orm(column_type = "Text")]
-    pub encrypted_mnemonic: String,
+    pub public_key: String,
+    pub socket_addr: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

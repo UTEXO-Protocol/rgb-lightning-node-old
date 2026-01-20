@@ -86,7 +86,7 @@ use crate::{
     rgb::{check_rgb_proxy_endpoint, get_rgb_channel_info_optional},
 };
 use crate::{
-    disk::{self, CHANNEL_PEER_DATA},
+    disk,
     error::APIError,
     ldk::{PaymentInfo, FEE_RATE, UTXO_SIZE_SAT},
     utils::{
@@ -1279,8 +1279,9 @@ pub(crate) async fn asset_balance(
         .map_err(|_| APIError::InvalidAssetID(payload.asset_id))?;
 
     let unlocked_state_clone = Arc::clone(&unlocked_state);
+    let contract_id_clone = contract_id;
     let balance = tokio::task::spawn_blocking(move || {
-        unlocked_state_clone.rgb_get_asset_balance(contract_id)
+        unlocked_state_clone.rgb_get_asset_balance(contract_id_clone)
     })
     .await
     .unwrap()
@@ -1521,10 +1522,11 @@ pub(crate) async fn connect_peer(
             connect_peer_if_necessary(peer_pubkey, peer_addr, unlocked_state.peer_manager.clone())
                 .await?;
             disk::persist_channel_peer(
-                &state.static_state.ldk_data_dir.join(CHANNEL_PEER_DATA),
+                &state.static_state.database_manager,
                 &peer_pubkey,
                 &peer_addr,
-            )?;
+            )
+            .await?;
         } else {
             return Err(APIError::InvalidPeerInfo(s!(
                 "incorrectly formatted peer info. Should be formatted as: `pubkey@host:port`"
@@ -1629,10 +1631,7 @@ pub(crate) async fn disconnect_peer(
             }
         }
 
-        disk::delete_channel_peer(
-            &state.static_state.ldk_data_dir.join(CHANNEL_PEER_DATA),
-            payload.peer_pubkey,
-        )?;
+        disk::delete_channel_peer(&state.static_state.database_manager, &peer_pubkey).await?;
 
         //check the pubkey matches a valid connected peer
         if unlocked_state
@@ -2073,76 +2072,83 @@ pub(crate) async fn list_channels(
     let guard = state.check_unlocked().await?;
     let unlocked_state = guard.as_ref().unwrap();
 
-    let mut channels = vec![];
-    for chan_info in unlocked_state.channel_manager.list_channels() {
-        let status = match chan_info.channel_shutdown_state.unwrap() {
-            ChannelShutdownState::NotShuttingDown => {
-                if chan_info.is_channel_ready {
-                    ChannelStatus::Opened
-                } else {
-                    ChannelStatus::Opening
+    let unlocked_state_copy = Arc::clone(unlocked_state);
+    let ldk_data_dir = state.static_state.ldk_data_dir.clone();
+    let channels = tokio::task::spawn_blocking(move || {
+        let mut channels = vec![];
+        for chan_info in unlocked_state_copy.channel_manager.list_channels() {
+            let status = match chan_info.channel_shutdown_state.unwrap() {
+                ChannelShutdownState::NotShuttingDown => {
+                    if chan_info.is_channel_ready {
+                        ChannelStatus::Opened
+                    } else {
+                        ChannelStatus::Opening
+                    }
+                }
+                _ => ChannelStatus::Closing,
+            };
+            let mut channel = Channel {
+                channel_id: chan_info.channel_id.0.as_hex().to_string(),
+                peer_pubkey: hex_str(&chan_info.counterparty.node_id.serialize()),
+                status,
+                ready: chan_info.is_channel_ready,
+                capacity_sat: chan_info.channel_value_satoshis,
+                outbound_balance_msat: chan_info.outbound_capacity_msat,
+                inbound_balance_msat: chan_info.inbound_capacity_msat,
+                next_outbound_htlc_limit_msat: chan_info.next_outbound_htlc_limit_msat,
+                next_outbound_htlc_minimum_msat: chan_info.next_outbound_htlc_minimum_msat,
+                is_usable: chan_info.is_usable,
+                public: chan_info.is_announced,
+                ..Default::default()
+            };
+
+            if let Some(funding_txo) = chan_info.funding_txo {
+                channel.funding_txid = Some(funding_txo.txid.to_string());
+                if let Ok(chan_monitor) = unlocked_state_copy
+                    .chain_monitor
+                    .get_monitor(chan_info.channel_id)
+                {
+                    channel.local_balance_sat = chan_monitor
+                        .get_claimable_balances()
+                        .iter()
+                        .map(|b| b.claimable_amount_satoshis())
+                        .sum::<u64>();
                 }
             }
-            _ => ChannelStatus::Closing,
-        };
-        let mut channel = Channel {
-            channel_id: chan_info.channel_id.0.as_hex().to_string(),
-            peer_pubkey: hex_str(&chan_info.counterparty.node_id.serialize()),
-            status,
-            ready: chan_info.is_channel_ready,
-            capacity_sat: chan_info.channel_value_satoshis,
-            outbound_balance_msat: chan_info.outbound_capacity_msat,
-            inbound_balance_msat: chan_info.inbound_capacity_msat,
-            next_outbound_htlc_limit_msat: chan_info.next_outbound_htlc_limit_msat,
-            next_outbound_htlc_minimum_msat: chan_info.next_outbound_htlc_minimum_msat,
-            is_usable: chan_info.is_usable,
-            public: chan_info.is_announced,
-            ..Default::default()
-        };
 
-        if let Some(funding_txo) = chan_info.funding_txo {
-            channel.funding_txid = Some(funding_txo.txid.to_string());
-            if let Ok(chan_monitor) = unlocked_state
-                .chain_monitor
-                .get_monitor(chan_info.channel_id)
+            if let Some(node_info) = unlocked_state_copy
+                .network_graph
+                .read_only()
+                .nodes()
+                .get(&NodeId::from_pubkey(&chan_info.counterparty.node_id))
             {
-                channel.local_balance_sat = chan_monitor
-                    .get_claimable_balances()
-                    .iter()
-                    .map(|b| b.claimable_amount_satoshis())
-                    .sum::<u64>();
+                if let Some(announcement) = &node_info.announcement_info {
+                    channel.peer_alias = Some(announcement.alias().to_string());
+                }
             }
-        }
 
-        if let Some(node_info) = unlocked_state
-            .network_graph
-            .read_only()
-            .nodes()
-            .get(&NodeId::from_pubkey(&chan_info.counterparty.node_id))
-        {
-            if let Some(announcement) = &node_info.announcement_info {
-                channel.peer_alias = Some(announcement.alias().to_string());
+            if let Some(id) = chan_info.short_channel_id {
+                channel.short_channel_id = Some(id);
             }
+
+            let info_file_path = get_rgb_channel_info_path(
+                &chan_info.channel_id.0.as_hex().to_string(),
+                &ldk_data_dir,
+                false,
+            );
+            if info_file_path.exists() {
+                let rgb_info = parse_rgb_channel_info(&info_file_path);
+                channel.asset_id = Some(rgb_info.contract_id.to_string());
+                channel.asset_local_amount = Some(rgb_info.local_rgb_amount);
+                channel.asset_remote_amount = Some(rgb_info.remote_rgb_amount);
+            };
+
+            channels.push(channel);
         }
-
-        if let Some(id) = chan_info.short_channel_id {
-            channel.short_channel_id = Some(id);
-        }
-
-        let info_file_path = get_rgb_channel_info_path(
-            &chan_info.channel_id.0.as_hex().to_string(),
-            &state.static_state.ldk_data_dir,
-            false,
-        );
-        if info_file_path.exists() {
-            let rgb_info = parse_rgb_channel_info(&info_file_path);
-            channel.asset_id = Some(rgb_info.contract_id.to_string());
-            channel.asset_local_amount = Some(rgb_info.local_rgb_amount);
-            channel.asset_remote_amount = Some(rgb_info.remote_rgb_amount);
-        };
-
-        channels.push(channel);
-    }
+        channels
+    })
+    .await
+    .unwrap();
 
     Ok(Json(ListChannelsResponse { channels }))
 }
@@ -3051,7 +3057,6 @@ pub(crate) async fn open_channel(
         let (peer_pubkey, mut peer_addr) =
             parse_peer_info(payload.peer_pubkey_and_opt_addr.to_string())?;
 
-        let peer_data_path = state.static_state.ldk_data_dir.join(CHANNEL_PEER_DATA);
         if peer_addr.is_none() {
             if let Some(peer) = unlocked_state.peer_manager.peer_by_node_id(&peer_pubkey) {
                 if let Some(socket_address) = peer.socket_address {
@@ -3063,7 +3068,8 @@ pub(crate) async fn open_channel(
             }
         }
         if peer_addr.is_none() {
-            let peer_info = disk::read_channel_peer_data(&peer_data_path)?;
+            let peer_info =
+                disk::read_channel_peer_data(&state.static_state.database_manager).await?;
             for (pubkey, addr) in peer_info.into_iter() {
                 if pubkey == peer_pubkey {
                     peer_addr = Some(addr);
@@ -3074,7 +3080,12 @@ pub(crate) async fn open_channel(
         if let Some(peer_addr) = peer_addr {
             connect_peer_if_necessary(peer_pubkey, peer_addr, unlocked_state.peer_manager.clone())
                 .await?;
-            disk::persist_channel_peer(&peer_data_path, &peer_pubkey, &peer_addr)?;
+            disk::persist_channel_peer(
+                &state.static_state.database_manager,
+                &peer_pubkey,
+                &peer_addr,
+            )
+            .await?;
         } else {
             return Err(APIError::InvalidPeerInfo(s!(
                 "cannot find the address for the provided pubkey"
@@ -3106,7 +3117,13 @@ pub(crate) async fn open_channel(
         };
 
         let consignment_endpoint = if let Some((contract_id, asset_amount)) = &colored_info {
-            let balance = unlocked_state.rgb_get_asset_balance(*contract_id)?;
+            let unlocked_state_clone = Arc::clone(unlocked_state);
+            let contract_id_clone = *contract_id;
+            let balance = tokio::task::spawn_blocking(move || {
+                unlocked_state_clone.rgb_get_asset_balance(contract_id_clone)
+            })
+            .await
+            .unwrap()?;
             let spendable_rgb_amount = balance.spendable;
 
             if *asset_amount > spendable_rgb_amount {
@@ -3124,9 +3141,14 @@ pub(crate) async fn open_channel(
             let script_buf = ScriptBuf::from_bytes(fake_p2wsh.to_vec());
             let recipient_id = recipient_id_from_script_buf(script_buf, state.static_state.network);
             let asset_id = contract_id.to_string();
-            let schema = unlocked_state
-                .rgb_get_asset_metadata(*contract_id)?
-                .asset_schema;
+            let unlocked_state_clone = Arc::clone(unlocked_state);
+            let contract_id_clone = *contract_id;
+            let schema = tokio::task::spawn_blocking(move || {
+                unlocked_state_clone.rgb_get_asset_metadata(contract_id_clone)
+            })
+            .await
+            .unwrap()?
+            .asset_schema;
             let assignment = match schema {
                 RgbLibAssetSchema::Nia | RgbLibAssetSchema::Cfa => {
                     Assignment::Fungible(*asset_amount)
