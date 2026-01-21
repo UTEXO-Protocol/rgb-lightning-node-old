@@ -342,6 +342,15 @@ pub(crate) async fn start_daemon(args: &UserArgs) -> Result<Arc<AppState>, AppEr
     let db_path = args.storage_dir_path.join("rln_db");
     let database_manager = Arc::new(crate::database::DatabaseManager::new(&db_path).await?);
 
+    // Migrate existing RGB config from files to database on startup
+    // and sync database values back to files for rust-lightning compatibility
+    database_manager
+        .migrate_indexer_url_from_file(&args.storage_dir_path)
+        .await?;
+    database_manager
+        .sync_rgb_config_to_files(&args.storage_dir_path)
+        .await?;
+
     let static_state = Arc::new(StaticState {
         ldk_peer_listening_port: args.ldk_peer_listening_port,
         network: args.network,

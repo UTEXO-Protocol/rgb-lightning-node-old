@@ -23,7 +23,7 @@ use lightning::onion_message::messenger::{
 };
 use lightning::rgb_utils::{
     get_rgb_channel_info_pending, is_channel_rgb, parse_rgb_payment_info, read_rgb_transfer_info,
-    update_rgb_channel_amount, BITCOIN_NETWORK_FNAME, INDEXER_URL_FNAME, STATIC_BLINDING,
+    update_rgb_channel_amount, BITCOIN_NETWORK_FNAME, STATIC_BLINDING,
     WALLET_ACCOUNT_XPUB_COLORED_FNAME, WALLET_ACCOUNT_XPUB_VANILLA_FNAME, WALLET_FINGERPRINT_FNAME,
     WALLET_MASTER_FINGERPRINT_FNAME,
 };
@@ -1634,39 +1634,82 @@ pub(crate) async fn start_ldk(
     tracing::info!("Bitcoind network check passed");
 
     // RGB setup
+    let storage_dir_path = app_state.static_state.storage_dir_path.clone();
+
     let indexer_url = if let Some(indexer_url) = &unlock_request.indexer_url {
         let indexer_protocol = check_indexer_url(indexer_url, bitcoin_network)?;
         tracing::info!(
             "Connected to an indexer with the {} protocol",
             indexer_protocol
         );
-        indexer_url
+        indexer_url.clone()
     } else {
-        tracing::info!("Using the default indexer");
-        match bitcoin_network {
-            BitcoinNetwork::Regtest => ELECTRUM_URL_REGTEST,
-            BitcoinNetwork::Signet => ELECTRUM_URL_SIGNET,
-            BitcoinNetwork::Testnet => ELECTRUM_URL_TESTNET,
-            BitcoinNetwork::Testnet4 => ELECTRUM_URL_TESTNET4,
-            BitcoinNetwork::Mainnet => ELECTRUM_URL_MAINNET,
+        tracing::info!("Checking database for saved indexer_url");
+        if let Some(saved_url) = app_state
+            .static_state
+            .database_manager
+            .load_rgb_config("indexer_url")
+            .await?
+        {
+            tracing::info!("Using saved indexer_url from database");
+            saved_url
+        } else {
+            tracing::info!("Using the default indexer");
+            match bitcoin_network {
+                BitcoinNetwork::Regtest => ELECTRUM_URL_REGTEST,
+                BitcoinNetwork::Signet => ELECTRUM_URL_SIGNET,
+                BitcoinNetwork::Testnet => ELECTRUM_URL_TESTNET,
+                BitcoinNetwork::Testnet4 => ELECTRUM_URL_TESTNET4,
+                BitcoinNetwork::Mainnet => ELECTRUM_URL_MAINNET,
+            }
+            .to_string()
         }
     };
+
     let proxy_endpoint = if let Some(proxy_endpoint) = &unlock_request.proxy_endpoint {
         check_rgb_proxy_endpoint(proxy_endpoint).await?;
         tracing::info!("Using a custom proxy");
-        proxy_endpoint
+        proxy_endpoint.clone()
     } else {
-        tracing::info!("Using the default proxy");
-        match bitcoin_network {
-            BitcoinNetwork::Signet
-            | BitcoinNetwork::Testnet
-            | BitcoinNetwork::Testnet4
-            | BitcoinNetwork::Mainnet => PROXY_ENDPOINT_PUBLIC,
-            BitcoinNetwork::Regtest => PROXY_ENDPOINT_LOCAL,
+        tracing::info!("Checking database for saved proxy_endpoint");
+        if let Some(saved_proxy) = app_state
+            .static_state
+            .database_manager
+            .load_rgb_config("proxy_endpoint")
+            .await?
+        {
+            tracing::info!("Using saved proxy_endpoint from database");
+            saved_proxy
+        } else {
+            tracing::info!("Using the default proxy");
+            match bitcoin_network {
+                BitcoinNetwork::Signet
+                | BitcoinNetwork::Testnet
+                | BitcoinNetwork::Testnet4
+                | BitcoinNetwork::Mainnet => PROXY_ENDPOINT_PUBLIC,
+                BitcoinNetwork::Regtest => PROXY_ENDPOINT_LOCAL,
+            }
+            .to_string()
         }
     };
-    let storage_dir_path = app_state.static_state.storage_dir_path.clone();
-    fs::write(storage_dir_path.join(INDEXER_URL_FNAME), indexer_url).expect("able to write");
+
+    // Save RGB config to database (source of truth) and sync to files
+    // Files are needed for rust-lightning library compatibility during wallet operations
+    app_state
+        .static_state
+        .database_manager
+        .save_rgb_config("indexer_url", &indexer_url)
+        .await?;
+    app_state
+        .static_state
+        .database_manager
+        .save_rgb_config("proxy_endpoint", &proxy_endpoint)
+        .await?;
+    app_state
+        .static_state
+        .database_manager
+        .sync_rgb_config_to_files(&storage_dir_path)
+        .await?;
     fs::write(
         storage_dir_path.join(BITCOIN_NETWORK_FNAME),
         bitcoin_network.to_string(),
