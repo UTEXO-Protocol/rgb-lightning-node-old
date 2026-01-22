@@ -3,15 +3,16 @@ use crate::error::APIError;
 use bitcoin::secp256k1::PublicKey;
 use migration::MigratorTrait;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue, ColumnTrait, Database, DatabaseConnection, DeleteResult,
-    EntityTrait, QueryFilter,
+    ActiveModelTrait, ActiveValue, ColumnTrait, ConnectOptions, Database, DatabaseConnection,
+    DeleteResult, EntityTrait, QueryFilter,
 };
 use std::collections::HashMap;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
-use std::fs;
 
 pub struct DatabaseManager {
     db: DatabaseConnection,
@@ -24,7 +25,10 @@ impl DatabaseManager {
         tracing::info!("Initializing database at path: {}", db_path.display());
         let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
         tracing::info!("Connecting to database URL: {}", db_url);
-        let db = Database::connect(&db_url)
+        let mut opt = ConnectOptions::new(db_url);
+        opt.max_connections(10)
+            .connect_timeout(Duration::from_secs(30));
+        let db = Database::connect(opt)
             .await
             .map_err(|e| APIError::DatabaseError(e.to_string()))?;
         tracing::info!("Database connected successfully");
@@ -187,7 +191,10 @@ impl DatabaseManager {
         }
 
         // Update cache with new value
-        self.rgb_config_cache.lock().await.insert(key.to_string(), Some(value.to_string()));
+        self.rgb_config_cache
+            .lock()
+            .await
+            .insert(key.to_string(), Some(value.to_string()));
 
         tracing::info!("RGB config saved successfully");
         Ok(())
@@ -233,13 +240,133 @@ impl DatabaseManager {
         tracing::info!("Found existing indexer_url file, migrating to database");
 
         let indexer_url = fs::read_to_string(&indexer_url_path)
-            .map_err(|e| APIError::IO(e))?
+            .map_err(APIError::IO)?
             .trim()
             .to_string();
 
         self.save_rgb_config("indexer_url", &indexer_url).await?;
 
         tracing::info!("Successfully migrated indexer_url from file to database");
+
+        Ok(())
+    }
+
+    pub async fn migrate_bitcoin_network_from_file(&self, storage_dir: &Path) -> Result<(), APIError> {
+        const BITCOIN_NETWORK_FNAME: &str = "bitcoin_network";
+
+        let bitcoin_network_path = storage_dir.join(BITCOIN_NETWORK_FNAME);
+
+        if !bitcoin_network_path.exists() {
+            tracing::info!("No existing bitcoin_network file found, skipping migration");
+            return Ok(());
+        }
+
+        tracing::info!("Found existing bitcoin_network file, migrating to database");
+
+        let bitcoin_network = fs::read_to_string(&bitcoin_network_path)
+            .map_err(APIError::IO)?
+            .trim()
+            .to_string();
+
+        self.save_rgb_config("bitcoin_network", &bitcoin_network).await?;
+
+        tracing::info!("Successfully migrated bitcoin_network from file to database");
+
+        Ok(())
+    }
+
+    pub async fn migrate_wallet_fingerprint_from_file(&self, storage_dir: &Path) -> Result<(), APIError> {
+        const WALLET_FINGERPRINT_FNAME: &str = "wallet_fingerprint";
+
+        let wallet_fingerprint_path = storage_dir.join(WALLET_FINGERPRINT_FNAME);
+
+        if !wallet_fingerprint_path.exists() {
+            tracing::info!("No existing wallet_fingerprint file found, skipping migration");
+            return Ok(());
+        }
+
+        tracing::info!("Found existing wallet_fingerprint file, migrating to database");
+
+        let wallet_fingerprint = fs::read_to_string(&wallet_fingerprint_path)
+            .map_err(APIError::IO)?
+            .trim()
+            .to_string();
+
+        self.save_rgb_config("wallet_fingerprint", &wallet_fingerprint).await?;
+
+        tracing::info!("Successfully migrated wallet_fingerprint from file to database");
+
+        Ok(())
+    }
+
+    pub async fn migrate_wallet_account_xpub_colored_from_file(&self, storage_dir: &Path) -> Result<(), APIError> {
+        const WALLET_ACCOUNT_XPUB_COLORED_FNAME: &str = "wallet_account_xpub_colored";
+
+        let wallet_account_xpub_colored_path = storage_dir.join(WALLET_ACCOUNT_XPUB_COLORED_FNAME);
+
+        if !wallet_account_xpub_colored_path.exists() {
+            tracing::info!("No existing wallet_account_xpub_colored file found, skipping migration");
+            return Ok(());
+        }
+
+        tracing::info!("Found existing wallet_account_xpub_colored file, migrating to database");
+
+        let wallet_account_xpub_colored = fs::read_to_string(&wallet_account_xpub_colored_path)
+            .map_err(APIError::IO)?
+            .trim()
+            .to_string();
+
+        self.save_rgb_config("wallet_account_xpub_colored", &wallet_account_xpub_colored).await?;
+
+        tracing::info!("Successfully migrated wallet_account_xpub_colored from file to database");
+
+        Ok(())
+    }
+
+    pub async fn migrate_wallet_account_xpub_vanilla_from_file(&self, storage_dir: &Path) -> Result<(), APIError> {
+        const WALLET_ACCOUNT_XPUB_VANILLA_FNAME: &str = "wallet_account_xpub_vanilla";
+
+        let wallet_account_xpub_vanilla_path = storage_dir.join(WALLET_ACCOUNT_XPUB_VANILLA_FNAME);
+
+        if !wallet_account_xpub_vanilla_path.exists() {
+            tracing::info!("No existing wallet_account_xpub_vanilla file found, skipping migration");
+            return Ok(());
+        }
+
+        tracing::info!("Found existing wallet_account_xpub_vanilla file, migrating to database");
+
+        let wallet_account_xpub_vanilla = fs::read_to_string(&wallet_account_xpub_vanilla_path)
+            .map_err(APIError::IO)?
+            .trim()
+            .to_string();
+
+        self.save_rgb_config("wallet_account_xpub_vanilla", &wallet_account_xpub_vanilla).await?;
+
+        tracing::info!("Successfully migrated wallet_account_xpub_vanilla from file to database");
+
+        Ok(())
+    }
+
+    pub async fn migrate_wallet_master_fingerprint_from_file(&self, storage_dir: &Path) -> Result<(), APIError> {
+        const WALLET_MASTER_FINGERPRINT_FNAME: &str = "wallet_master_fingerprint";
+
+        let wallet_master_fingerprint_path = storage_dir.join(WALLET_MASTER_FINGERPRINT_FNAME);
+
+        if !wallet_master_fingerprint_path.exists() {
+            tracing::info!("No existing wallet_master_fingerprint file found, skipping migration");
+            return Ok(());
+        }
+
+        tracing::info!("Found existing wallet_master_fingerprint file, migrating to database");
+
+        let wallet_master_fingerprint = fs::read_to_string(&wallet_master_fingerprint_path)
+            .map_err(APIError::IO)?
+            .trim()
+            .to_string();
+
+        self.save_rgb_config("wallet_master_fingerprint", &wallet_master_fingerprint).await?;
+
+        tracing::info!("Successfully migrated wallet_master_fingerprint from file to database");
 
         Ok(())
     }
@@ -251,20 +378,60 @@ impl DatabaseManager {
     pub async fn sync_rgb_config_to_files(&self, storage_dir: &Path) -> Result<(), APIError> {
         const INDEXER_URL_FNAME: &str = "indexer_url";
         const PROXY_ENDPOINT_FNAME: &str = "proxy_endpoint";
+        const BITCOIN_NETWORK_FNAME: &str = "bitcoin_network";
+        const WALLET_FINGERPRINT_FNAME: &str = "wallet_fingerprint";
+        const WALLET_ACCOUNT_XPUB_COLORED_FNAME: &str = "wallet_account_xpub_colored";
+        const WALLET_ACCOUNT_XPUB_VANILLA_FNAME: &str = "wallet_account_xpub_vanilla";
+        const WALLET_MASTER_FINGERPRINT_FNAME: &str = "wallet_master_fingerprint";
 
         let indexer_url = self.load_rgb_config("indexer_url").await?;
         let proxy_endpoint = self.load_rgb_config("proxy_endpoint").await?;
+        let bitcoin_network = self.load_rgb_config("bitcoin_network").await?;
+        let wallet_fingerprint = self.load_rgb_config("wallet_fingerprint").await?;
+        let wallet_account_xpub_colored = self.load_rgb_config("wallet_account_xpub_colored").await?;
+        let wallet_account_xpub_vanilla = self.load_rgb_config("wallet_account_xpub_vanilla").await?;
+        let wallet_master_fingerprint = self.load_rgb_config("wallet_master_fingerprint").await?;
 
         if let Some(url) = indexer_url {
             let indexer_url_path = storage_dir.join(INDEXER_URL_FNAME);
-            fs::write(&indexer_url_path, url).map_err(|e| APIError::IO(e))?;
+            fs::write(&indexer_url_path, url).map_err(APIError::IO)?;
             tracing::info!("Synced indexer_url to file");
         }
 
         if let Some(proxy) = proxy_endpoint {
             let proxy_endpoint_path = storage_dir.join(PROXY_ENDPOINT_FNAME);
-            fs::write(&proxy_endpoint_path, proxy).map_err(|e| APIError::IO(e))?;
+            fs::write(&proxy_endpoint_path, proxy).map_err(APIError::IO)?;
             tracing::info!("Synced proxy_endpoint to file");
+        }
+
+        if let Some(network) = bitcoin_network {
+            let bitcoin_network_path = storage_dir.join(BITCOIN_NETWORK_FNAME);
+            fs::write(&bitcoin_network_path, network).map_err(APIError::IO)?;
+            tracing::info!("Synced bitcoin_network to file");
+        }
+
+        if let Some(fingerprint) = wallet_fingerprint {
+            let wallet_fingerprint_path = storage_dir.join(WALLET_FINGERPRINT_FNAME);
+            fs::write(&wallet_fingerprint_path, fingerprint).map_err(APIError::IO)?;
+            tracing::info!("Synced wallet_fingerprint to file");
+        }
+
+        if let Some(xpub_colored) = wallet_account_xpub_colored {
+            let wallet_account_xpub_colored_path = storage_dir.join(WALLET_ACCOUNT_XPUB_COLORED_FNAME);
+            fs::write(&wallet_account_xpub_colored_path, xpub_colored).map_err(APIError::IO)?;
+            tracing::info!("Synced wallet_account_xpub_colored to file");
+        }
+
+        if let Some(xpub_vanilla) = wallet_account_xpub_vanilla {
+            let wallet_account_xpub_vanilla_path = storage_dir.join(WALLET_ACCOUNT_XPUB_VANILLA_FNAME);
+            fs::write(&wallet_account_xpub_vanilla_path, xpub_vanilla).map_err(APIError::IO)?;
+            tracing::info!("Synced wallet_account_xpub_vanilla to file");
+        }
+
+        if let Some(master_fingerprint) = wallet_master_fingerprint {
+            let wallet_master_fingerprint_path = storage_dir.join(WALLET_MASTER_FINGERPRINT_FNAME);
+            fs::write(&wallet_master_fingerprint_path, master_fingerprint).map_err(APIError::IO)?;
+            tracing::info!("Synced wallet_master_fingerprint to file");
         }
 
         Ok(())

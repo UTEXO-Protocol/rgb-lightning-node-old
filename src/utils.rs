@@ -348,6 +348,21 @@ pub(crate) async fn start_daemon(args: &UserArgs) -> Result<Arc<AppState>, AppEr
         .migrate_indexer_url_from_file(&args.storage_dir_path)
         .await?;
     database_manager
+        .migrate_bitcoin_network_from_file(&args.storage_dir_path)
+        .await?;
+    database_manager
+        .migrate_wallet_fingerprint_from_file(&args.storage_dir_path)
+        .await?;
+    database_manager
+        .migrate_wallet_account_xpub_colored_from_file(&args.storage_dir_path)
+        .await?;
+    database_manager
+        .migrate_wallet_account_xpub_vanilla_from_file(&args.storage_dir_path)
+        .await?;
+    database_manager
+        .migrate_wallet_master_fingerprint_from_file(&args.storage_dir_path)
+        .await?;
+    database_manager
         .sync_rgb_config_to_files(&args.storage_dir_path)
         .await?;
 

@@ -23,9 +23,7 @@ use lightning::onion_message::messenger::{
 };
 use lightning::rgb_utils::{
     get_rgb_channel_info_pending, is_channel_rgb, parse_rgb_payment_info, read_rgb_transfer_info,
-    update_rgb_channel_amount, BITCOIN_NETWORK_FNAME, STATIC_BLINDING,
-    WALLET_ACCOUNT_XPUB_COLORED_FNAME, WALLET_ACCOUNT_XPUB_VANILLA_FNAME, WALLET_FINGERPRINT_FNAME,
-    WALLET_MASTER_FINGERPRINT_FNAME,
+    update_rgb_channel_amount, STATIC_BLINDING,
 };
 use lightning::routing::gossip;
 use lightning::routing::gossip::{NodeId, P2PGossipSync};
@@ -1708,13 +1706,13 @@ pub(crate) async fn start_ldk(
     app_state
         .static_state
         .database_manager
+        .save_rgb_config("bitcoin_network", &bitcoin_network.to_string())
+        .await?;
+    app_state
+        .static_state
+        .database_manager
         .sync_rgb_config_to_files(&storage_dir_path)
         .await?;
-    fs::write(
-        storage_dir_path.join(BITCOIN_NETWORK_FNAME),
-        bitcoin_network.to_string(),
-    )
-    .expect("able to write");
 
     // Initialize the FeeEstimator
     // BitcoindClient implements the FeeEstimator trait, so it'll act as our fee estimator.
@@ -1905,32 +1903,33 @@ pub(crate) async fn start_ldk(
     let (rgb_wallet, rgb_online) = spawn_result
         .map_err(|e: rgb_lib::Error| APIError::Unexpected(format!("RGB wallet error: {}", e)))?;
     tracing::info!("RGB wallet created and online");
-    fs::write(
-        static_state.storage_dir_path.join(WALLET_FINGERPRINT_FNAME),
-        account_xpub_colored.fingerprint().to_string(),
-    )
-    .expect("able to write");
-    fs::write(
-        static_state
-            .storage_dir_path
-            .join(WALLET_ACCOUNT_XPUB_COLORED_FNAME),
-        account_xpub_colored.to_string(),
-    )
-    .expect("able to write");
-    fs::write(
-        static_state
-            .storage_dir_path
-            .join(WALLET_ACCOUNT_XPUB_VANILLA_FNAME),
-        account_xpub_vanilla.to_string(),
-    )
-    .expect("able to write");
-    fs::write(
-        static_state
-            .storage_dir_path
-            .join(WALLET_MASTER_FINGERPRINT_FNAME),
-        master_fingerprint.to_string(),
-    )
-    .expect("able to write");
+
+    // Save wallet configs to database (source of truth) and sync to files
+    app_state
+        .static_state
+        .database_manager
+        .save_rgb_config("wallet_fingerprint", &account_xpub_colored.fingerprint().to_string())
+        .await?;
+    app_state
+        .static_state
+        .database_manager
+        .save_rgb_config("wallet_account_xpub_colored", &account_xpub_colored.to_string())
+        .await?;
+    app_state
+        .static_state
+        .database_manager
+        .save_rgb_config("wallet_account_xpub_vanilla", &account_xpub_vanilla.to_string())
+        .await?;
+    app_state
+        .static_state
+        .database_manager
+        .save_rgb_config("wallet_master_fingerprint", &master_fingerprint.to_string())
+        .await?;
+    app_state
+        .static_state
+        .database_manager
+        .sync_rgb_config_to_files(&static_state.storage_dir_path)
+        .await?;
 
     let rgb_wallet_wrapper = Arc::new(RgbLibWalletWrapper::new(
         Arc::new(Mutex::new(rgb_wallet)),
