@@ -111,6 +111,7 @@ pub(crate) struct UnlockedAppState {
     pub(crate) rgb_send_lock: Arc<Mutex<bool>>,
     pub(crate) channel_ids_map: Arc<Mutex<ChannelIdsMap>>,
     pub(crate) proxy_endpoint: String,
+    pub(crate) database_manager: Arc<crate::database::DatabaseManager>,
 }
 
 impl UnlockedAppState {

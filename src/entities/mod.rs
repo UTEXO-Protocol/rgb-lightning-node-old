@@ -2,6 +2,7 @@
 
 pub mod prelude;
 
+pub mod channel_ids;
 pub mod channel_peer_data;
 pub mod mnemonic;
 pub mod revoked_token;

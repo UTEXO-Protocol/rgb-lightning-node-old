@@ -92,8 +92,8 @@ use tokio::time::timeout;
 
 use crate::bitcoind::BitcoindClient;
 use crate::disk::{
-    self, FilesystemLogger, CHANNEL_IDS_FNAME, INBOUND_PAYMENTS_FNAME, MAKER_SWAPS_FNAME,
-    OUTBOUND_PAYMENTS_FNAME, OUTPUT_SPENDER_TXES, TAKER_SWAPS_FNAME,
+    self, FilesystemLogger, INBOUND_PAYMENTS_FNAME, MAKER_SWAPS_FNAME, OUTBOUND_PAYMENTS_FNAME,
+    OUTPUT_SPENDER_TXES, TAKER_SWAPS_FNAME,
 };
 use crate::error::APIError;
 use crate::rgb::{check_rgb_proxy_endpoint, get_rgb_channel_info_optional, RgbLibWalletWrapper};
@@ -369,36 +369,63 @@ impl UnlockedAppState {
         former_temporary_channel_id: ChannelId,
         channel_id: ChannelId,
     ) {
-        let mut channel_ids_map = self.get_channel_ids_map();
-        channel_ids_map
-            .channel_ids
-            .insert(former_temporary_channel_id, channel_id);
-        self.save_channel_ids_map(channel_ids_map);
+        {
+            let mut channel_ids_map = self.get_channel_ids_map();
+            channel_ids_map
+                .channel_ids
+                .insert(former_temporary_channel_id, channel_id);
+        } // Release the lock before spawning async task
+
+        // Persist to database in a separate blocking thread with its own runtime
+        // This avoids deadlocks with single-threaded tokio runtimes
+        let db_manager = Arc::clone(&self.database_manager);
+        let temp_id = former_temporary_channel_id;
+        let chan_id = channel_id;
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create runtime for channel_id persistence");
+            rt.block_on(async {
+                if let Err(e) = db_manager.save_channel_id(&temp_id, &chan_id).await {
+                    tracing::error!("Failed to save channel ID to database: {}", e);
+                }
+            });
+        });
     }
 
     pub(crate) fn delete_channel_id(&self, channel_id: ChannelId) {
-        let mut channel_ids_map = self.get_channel_ids_map();
-        if let Some(temporary_channel_id) = channel_ids_map
-            .channel_ids
-            .clone()
-            .into_iter()
-            .find_map(|(tmp_chan_id, chan_id)| {
-                if chan_id == channel_id {
-                    Some(tmp_chan_id)
-                } else {
-                    None
-                }
-            })
         {
-            channel_ids_map.channel_ids.remove(&temporary_channel_id);
-            self.save_channel_ids_map(channel_ids_map);
+            let mut channel_ids_map = self.get_channel_ids_map();
+            if let Some(temporary_channel_id) =
+                channel_ids_map.channel_ids.clone().into_iter().find_map(
+                    |(tmp_chan_id, chan_id)| {
+                        if chan_id == channel_id {
+                            Some(tmp_chan_id)
+                        } else {
+                            None
+                        }
+                    },
+                )
+            {
+                channel_ids_map.channel_ids.remove(&temporary_channel_id);
+            }
         }
-    }
 
-    fn save_channel_ids_map(&self, channel_ids: MutexGuard<ChannelIdsMap>) {
-        self.fs_store
-            .write("", "", CHANNEL_IDS_FNAME, channel_ids.encode())
-            .unwrap();
+        // Delete from database in a separate blocking thread with its own runtime
+        let db_manager = Arc::clone(&self.database_manager);
+        let chan_id = channel_id;
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create runtime for channel_id deletion");
+            rt.block_on(async {
+                if let Err(e) = db_manager.delete_channel_id_by_channel_id(&chan_id).await {
+                    tracing::error!("Failed to delete channel ID from database: {}", e);
+                }
+            });
+        });
     }
 }
 
@@ -1908,17 +1935,26 @@ pub(crate) async fn start_ldk(
     app_state
         .static_state
         .database_manager
-        .save_rgb_config("wallet_fingerprint", &account_xpub_colored.fingerprint().to_string())
+        .save_rgb_config(
+            "wallet_fingerprint",
+            &account_xpub_colored.fingerprint().to_string(),
+        )
         .await?;
     app_state
         .static_state
         .database_manager
-        .save_rgb_config("wallet_account_xpub_colored", &account_xpub_colored.to_string())
+        .save_rgb_config(
+            "wallet_account_xpub_colored",
+            &account_xpub_colored.to_string(),
+        )
         .await?;
     app_state
         .static_state
         .database_manager
-        .save_rgb_config("wallet_account_xpub_vanilla", &account_xpub_vanilla.to_string())
+        .save_rgb_config(
+            "wallet_account_xpub_vanilla",
+            &account_xpub_vanilla.to_string(),
+        )
         .await?;
     app_state
         .static_state
@@ -2193,10 +2229,15 @@ pub(crate) async fn start_ldk(
         &ldk_data_dir.join(TAKER_SWAPS_FNAME),
     )));
 
-    // Read channel IDs info
-    let channel_ids_map = Arc::new(Mutex::new(disk::read_channel_ids_info(
-        &ldk_data_dir.join(CHANNEL_IDS_FNAME),
-    )));
+    let database_manager = Arc::clone(&app_state.static_state.database_manager);
+    database_manager
+        .migrate_channel_ids_from_file(&ldk_data_dir)
+        .await?;
+
+    let channel_ids_from_db = database_manager.load_channel_ids().await?;
+    let channel_ids_map = Arc::new(Mutex::new(ChannelIdsMap {
+        channel_ids: channel_ids_from_db.into_iter().collect(),
+    }));
 
     let unlocked_state = Arc::new(UnlockedAppState {
         channel_manager: Arc::clone(&channel_manager),
@@ -2217,6 +2258,7 @@ pub(crate) async fn start_ldk(
         rgb_send_lock: Arc::new(Mutex::new(false)),
         channel_ids_map,
         proxy_endpoint: proxy_endpoint.to_string(),
+        database_manager: Arc::clone(&database_manager),
     });
 
     let recent_payments_payment_ids = channel_manager

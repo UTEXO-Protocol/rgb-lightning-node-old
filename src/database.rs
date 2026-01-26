@@ -1,4 +1,6 @@
-use crate::entities::{channel_peer_data, mnemonic, prelude::*, revoked_token, rgb_config};
+use crate::entities::{channel_ids, channel_peer_data, mnemonic, prelude::*, revoked_token, rgb_config};
+use crate::utils::{hex_str, hex_str_to_vec};
+use lightning::ln::types::ChannelId;
 use crate::error::APIError;
 use bitcoin::secp256k1::PublicKey;
 use migration::MigratorTrait;
@@ -426,6 +428,154 @@ impl DatabaseManager {
 
         tracing::info!("Loaded {} revoked tokens from database", revoked.len());
         Ok(revoked)
+    }
+
+    pub async fn save_channel_id(
+        &self,
+        temporary_channel_id: &ChannelId,
+        channel_id: &ChannelId,
+    ) -> Result<(), APIError> {
+        let temp_id_hex = hex_str(&temporary_channel_id.0);
+        let chan_id_hex = hex_str(&channel_id.0);
+        tracing::debug!(
+            "Saving channel ID mapping to database: {} -> {}",
+            temp_id_hex,
+            chan_id_hex
+        );
+
+        let existing = ChannelIds::find()
+            .filter(channel_ids::Column::TemporaryChannelId.eq(&temp_id_hex))
+            .one(&self.db)
+            .await
+            .map_err(|e| APIError::DatabaseError(e.to_string()))?;
+
+        if let Some(model) = existing {
+            let mut active_model: channel_ids::ActiveModel = model.into();
+            active_model.channel_id = ActiveValue::Set(chan_id_hex);
+            active_model
+                .update(&self.db)
+                .await
+                .map_err(|e| APIError::DatabaseError(e.to_string()))?;
+        } else {
+            let new_entry = channel_ids::ActiveModel {
+                id: ActiveValue::NotSet,
+                temporary_channel_id: ActiveValue::Set(temp_id_hex),
+                channel_id: ActiveValue::Set(chan_id_hex),
+            };
+            new_entry
+                .insert(&self.db)
+                .await
+                .map_err(|e| APIError::DatabaseError(e.to_string()))?;
+        }
+
+        tracing::debug!("Channel ID mapping saved successfully");
+        Ok(())
+    }
+
+    pub async fn load_channel_ids(&self) -> Result<HashMap<ChannelId, ChannelId>, APIError> {
+        tracing::debug!("Loading channel IDs from database");
+
+        let entries = ChannelIds::find()
+            .all(&self.db)
+            .await
+            .map_err(|e| APIError::DatabaseError(e.to_string()))?;
+
+        let mut channel_ids_map = HashMap::new();
+        for entry in entries {
+            let temp_id_bytes = match hex_str_to_vec(&entry.temporary_channel_id) {
+                Some(bytes) => bytes,
+                None => {
+                    tracing::warn!(
+                        "Invalid temporary_channel_id hex in database: {}",
+                        entry.temporary_channel_id
+                    );
+                    continue;
+                }
+            };
+            let chan_id_bytes = match hex_str_to_vec(&entry.channel_id) {
+                Some(bytes) => bytes,
+                None => {
+                    tracing::warn!(
+                        "Invalid channel_id hex in database: {}",
+                        entry.channel_id
+                    );
+                    continue;
+                }
+            };
+
+            if temp_id_bytes.len() != 32 || chan_id_bytes.len() != 32 {
+                tracing::warn!(
+                    "Invalid channel ID length in database: temp={}, chan={}",
+                    temp_id_bytes.len(),
+                    chan_id_bytes.len()
+                );
+                continue;
+            }
+
+            let temp_id = ChannelId(<[u8; 32]>::try_from(temp_id_bytes.as_slice()).unwrap());
+            let chan_id = ChannelId(<[u8; 32]>::try_from(chan_id_bytes.as_slice()).unwrap());
+            channel_ids_map.insert(temp_id, chan_id);
+        }
+
+        tracing::debug!("Loaded {} channel ID mappings from database", channel_ids_map.len());
+        Ok(channel_ids_map)
+    }
+
+    pub async fn delete_channel_id_by_channel_id(
+        &self,
+        channel_id: &ChannelId,
+    ) -> Result<(), APIError> {
+        let chan_id_hex = hex_str(&channel_id.0);
+        tracing::debug!("Deleting channel ID mapping by channel_id: {}", chan_id_hex);
+
+        let result: DeleteResult = ChannelIds::delete_many()
+            .filter(channel_ids::Column::ChannelId.eq(&chan_id_hex))
+            .exec(&self.db)
+            .await
+            .map_err(|e| APIError::DatabaseError(e.to_string()))?;
+
+        if result.rows_affected > 0 {
+            tracing::debug!("Channel ID mapping deleted successfully");
+        } else {
+            tracing::debug!("No channel ID mapping found for deletion");
+        }
+
+        Ok(())
+    }
+
+    pub async fn migrate_channel_ids_from_file(
+        &self,
+        ldk_data_dir: &Path,
+    ) -> Result<(), APIError> {
+        use crate::disk::{read_channel_ids_info, CHANNEL_IDS_FNAME};
+
+        let channel_ids_path = ldk_data_dir.join(CHANNEL_IDS_FNAME);
+
+        if !channel_ids_path.exists() {
+            tracing::info!("No existing channel_ids file found, skipping migration");
+            return Ok(());
+        }
+
+        tracing::info!("Found existing channel_ids file, migrating to database");
+
+        let channel_ids_map = read_channel_ids_info(&channel_ids_path);
+
+        for (temp_id, chan_id) in channel_ids_map.channel_ids.iter() {
+            self.save_channel_id(temp_id, chan_id).await?;
+        }
+
+        tracing::info!(
+            "Successfully migrated {} channel ID mappings from file to database",
+            channel_ids_map.channel_ids.len()
+        );
+
+        if let Err(e) = fs::remove_file(&channel_ids_path) {
+            tracing::warn!("Failed to remove old channel_ids file: {}", e);
+        } else {
+            tracing::info!("Removed old channel_ids file after migration");
+        }
+
+        Ok(())
     }
 
     /// Syncs RGB config values from database to filesystem files.
