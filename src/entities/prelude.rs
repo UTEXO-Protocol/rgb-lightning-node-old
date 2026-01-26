@@ -2,4 +2,5 @@
 
 pub use super::channel_peer_data::Entity as ChannelPeerData;
 pub use super::mnemonic::Entity as Mnemonic;
+pub use super::revoked_token::Entity as RevokedToken;
 pub use super::rgb_config::Entity as RgbConfig;

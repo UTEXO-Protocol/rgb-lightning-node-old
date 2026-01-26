@@ -4,4 +4,5 @@ pub mod prelude;
 
 pub mod channel_peer_data;
 pub mod mnemonic;
+pub mod revoked_token;
 pub mod rgb_config;

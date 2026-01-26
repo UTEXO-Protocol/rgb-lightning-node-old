@@ -3360,7 +3360,7 @@ pub(crate) async fn revoke_token(
 
     let token_to_revoke = Biscuit::from_base64(&payload.token, root_pubkey)
         .map_err(|_| APIError::InvalidBiscuitToken)?;
-    state.revoke_token(&token_to_revoke)?;
+    state.revoke_token(&token_to_revoke).await?;
 
     Ok(Json(EmptyResponse {}))
 }

@@ -1,4 +1,4 @@
-use crate::entities::{channel_peer_data, mnemonic, prelude::*, rgb_config};
+use crate::entities::{channel_peer_data, mnemonic, prelude::*, revoked_token, rgb_config};
 use crate::error::APIError;
 use bitcoin::secp256k1::PublicKey;
 use migration::MigratorTrait;
@@ -369,6 +369,63 @@ impl DatabaseManager {
         tracing::info!("Successfully migrated wallet_master_fingerprint from file to database");
 
         Ok(())
+    }
+
+    /// Saves a revoked token's revocation identifier to the database.
+    /// The revocation_id is stored as a hex-encoded string.
+    pub async fn save_revoked_token(&self, revocation_id_hex: &str) -> Result<(), APIError> {
+        tracing::debug!("Saving revoked token to database: {}", revocation_id_hex);
+
+        // Check if already exists to avoid duplicate key errors
+        let existing = RevokedToken::find()
+            .filter(revoked_token::Column::RevocationId.eq(revocation_id_hex))
+            .one(&self.db)
+            .await
+            .map_err(|e| APIError::DatabaseError(e.to_string()))?;
+
+        if existing.is_some() {
+            tracing::debug!("Revocation ID already exists in database, skipping");
+            return Ok(());
+        }
+
+        let new_revoked_token = revoked_token::ActiveModel {
+            id: ActiveValue::NotSet,
+            revocation_id: ActiveValue::Set(revocation_id_hex.to_string()),
+        };
+
+        new_revoked_token
+            .insert(&self.db)
+            .await
+            .map_err(|e| APIError::DatabaseError(e.to_string()))?;
+
+        tracing::debug!("Revoked token saved successfully");
+        Ok(())
+    }
+
+    /// Loads all revoked token revocation identifiers from the database.
+    /// Returns a HashSet of raw byte vectors (decoded from hex).
+    pub async fn load_revoked_tokens(&self) -> Result<std::collections::HashSet<Vec<u8>>, APIError> {
+        tracing::info!("Loading revoked tokens from database");
+
+        let tokens = RevokedToken::find()
+            .all(&self.db)
+            .await
+            .map_err(|e| APIError::DatabaseError(e.to_string()))?;
+
+        let mut revoked: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for token in tokens {
+            if let Some(bytes) = crate::utils::hex_str_to_vec(&token.revocation_id) {
+                revoked.insert(bytes);
+            } else {
+                tracing::warn!(
+                    "Invalid hex string in revoked_token table: {}",
+                    token.revocation_id
+                );
+            }
+        }
+
+        tracing::info!("Loaded {} revoked tokens from database", revoked.len());
+        Ok(revoked)
     }
 
     /// Syncs RGB config values from database to filesystem files.

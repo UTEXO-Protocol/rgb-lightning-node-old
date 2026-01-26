@@ -529,9 +529,6 @@ pub enum AppError {
     #[error("The provided authentication args are invalid")]
     InvalidAuthenticationArgs,
 
-    #[error("The revoked tokens file contains an invalid entry")]
-    InvalidRevokedTokensFile,
-
     #[error("The provided root public key is invalid")]
     InvalidRootKey,
 

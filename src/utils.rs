@@ -386,9 +386,13 @@ pub(crate) async fn start_daemon(args: &UserArgs) -> Result<Arc<AppState>, AppEr
         revoked_tokens: Arc::new(Mutex::new(HashSet::new())),
     });
 
-    // Load revoked tokens from file if authentication is enabled
+    // Load revoked tokens from database if authentication is enabled
     if app_state.root_public_key.is_some() {
-        let loaded_tokens = app_state.load_revoked_tokens()?;
+        let loaded_tokens = app_state
+            .static_state
+            .database_manager
+            .load_revoked_tokens()
+            .await?;
         *app_state.revoked_tokens.lock().unwrap() = loaded_tokens;
     }
 
