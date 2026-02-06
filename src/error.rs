@@ -366,7 +366,7 @@ impl From<RgbLibError> for APIError {
             }
             RgbLibError::InvalidAddress { details } => APIError::InvalidAddress(details),
             RgbLibError::InvalidAmountZero => APIError::InvalidAmount(s!("0")),
-            RgbLibError::InvalidAssetID { asset_id } => APIError::InvalidAssetID(asset_id),
+            // InvalidAssetID удалён в rgb-lib (sync-with-tools)
             RgbLibError::InvalidAssignment => APIError::InvalidAssignment,
             RgbLibError::InvalidAttachments { details } => APIError::InvalidAttachments(details),
             RgbLibError::InvalidDetails { details } => APIError::InvalidDetails(details),
