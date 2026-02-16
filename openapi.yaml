@@ -115,6 +115,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BtcBalanceResponse'
+  /cancelhodlinvoice:
+    post:
+      tags:
+        - Invoices
+      summary: Cancel a HODL invoice
+      description: Cancel a held HTLC for a HODL invoice. Rejects cancellation if a settlement is already in progress.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvoiceCancelRequest'
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyResponse'
   /changepassword:
     post:
       tags:
@@ -368,6 +386,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/GetPaymentResponse'
+  /getpaymentpreimage:
+    post:
+      tags:
+        - Payments
+      summary: Get a payment preimage by its payment hash
+      description: Get the preimage for an outbound payment when it has been completed successfully
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GetPaymentPreimageRequest'
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetPaymentPreimageResponse'
   /getswap:
     post:
       tags:
@@ -386,6 +422,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/GetSwapResponse'
+  /hodlinvoice:
+    post:
+      tags:
+        - Invoices
+      summary: Create a HODL LN invoice
+      description: Create a BOLT11 invoice with a caller-provided payment hash; settlement is deferred until settle/cancel. Metadata is persisted first to preserve HODL semantics across restarts.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvoiceHodlRequest'
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceHodlResponse'
   /init:
     post:
       tags:
@@ -892,6 +946,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SendRgbResponse'
+  /settlehodlinvoice:
+    post:
+      tags:
+        - Invoices
+      summary: Settle a HODL invoice
+      description: Claim a held HTLC for a HODL invoice
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvoiceSettleRequest'
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyResponse'
   /shutdown:
     post:
       tags:
@@ -1330,7 +1402,7 @@ components:
     CheckProxyEndpointRequest:
       type: object
       properties:
-        proxy_url:
+        proxy_endpoint:
           type: string
           example: rpc://127.0.0.1:3000/json-rpc
     CloseChannelRequest:
@@ -1519,6 +1591,23 @@ components:
       properties:
         payment:
           $ref: '#/components/schemas/Payment'
+    GetPaymentPreimageRequest:
+      type: object
+      required:
+        - payment_hash
+      properties:
+        payment_hash:
+          type: string
+          example: b4cb2da889477082a2e47f37a07e646e60ef6f97ffa7a4d88c823efd673da94b
+    GetPaymentPreimageResponse:
+      type: object
+      properties:
+        status:
+          $ref: '#/components/schemas/HTLCStatus'
+        preimage:
+          type: string
+          nullable: true
+          example: eade701c7b23b8799465f4284ad84710fc16a776fbc6483001291149122695a8
     GetSwapRequest:
       type: object
       properties:
@@ -1537,7 +1626,9 @@ components:
       type: string
       enum:
         - Pending
+        - Claimable
         - Succeeded
+        - Cancelled
         - Failed
     IndexerProtocol:
       type: string
@@ -1556,11 +1647,65 @@ components:
         mnemonic:
           type: string
           example: skill lamp please gown put season degree collect decline account monitor insane
+    InvoiceCancelRequest:
+      type: object
+      required:
+        - payment_hash
+      properties:
+        payment_hash:
+          type: string
+          example: 3febfae1e68b190c15461f4c2a3290f9af1dae63fd7d620d2bd61601869026cd
+    InvoiceHodlRequest:
+      type: object
+      required:
+        - payment_hash
+        - expiry_sec
+      properties:
+        amt_msat:
+          type: integer
+          example: 3000000
+        expiry_sec:
+          type: integer
+          example: 86400
+        asset_id:
+          type: string
+          example: rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ8
+        asset_amount:
+          type: integer
+          example: 42
+        payment_hash:
+          type: string
+          example: 3febfae1e68b190c15461f4c2a3290f9af1dae63fd7d620d2bd61601869026cd
+        external_ref:
+          type: string
+          example: swap-123
+    InvoiceHodlResponse:
+      type: object
+      properties:
+        invoice:
+          type: string
+          example: lnbcrt30u1pjv6yzndqud3jxktt5w46x7unfv9kz6mn0v3jsnp4qdpc280eur52luxppv6f3nnj8l6vnd9g2hnv3qv6mjhmhvlzf6327pp5tjjasx6g9dqptea3fhm6yllq5wxzycnnvp8l6wcq3d6j2uvpryuqsp5l8az8x3g8fe05dg7cmgddld3da09nfjvky8xftwsk4cj8p2l7kfq9qyysgqcqpcxqzdylzlwfnkyw3jv344x4rzwgkk53ng0fhxy5rdduk4g5tpvea8xa6rfckkza35va28xjn2tqkhgarcxep5umm4x5k56wfcdvu95eq7qzp20vrl4xz76syapsa3c09j7lg5gerkaj63llj0ark7ph8hfketn6fkqzm8laf66dhsncm23wkwm5l5377we9e8lnlknnkwje5eefkccusqm6rqt8
+        payment_secret:
+          type: string
+          example: 777a7756c620868199ed5fdc35bee4095b5709d543e5c2bf0494396bf27d2ea2
+    InvoiceSettleRequest:
+      type: object
+      required:
+        - payment_hash
+        - payment_preimage
+      properties:
+        payment_hash:
+          type: string
+          example: b4cb2da889477082a2e47f37a07e646e60ef6f97ffa7a4d88c823efd673da94b
+        payment_preimage:
+          type: string
+          example: eade701c7b23b8799465f4284ad84710fc16a776fbc6483001291149122695a8
     InvoiceStatus:
       type: string
       enum:
         - Pending
         - Succeeded
+        - Cancelled
         - Failed
         - Expired
     InvoiceStatusRequest:

@@ -1,12 +1,15 @@
 use amplify::s;
 use biscuit_auth::{builder::date, macros::*, KeyPair};
+use bitcoin::hashes::{sha256::Hash as Sha256, Hash};
 use chrono::{DateTime, Local, Utc};
 use electrum_client::ElectrumApi;
 use lazy_static::lazy_static;
 use lightning_invoice::Bolt11Invoice;
 use once_cell::sync::Lazy;
-use reqwest::Response;
+use rand::RngCore;
+use reqwest::{Response, StatusCode};
 use rgb_lib::BitcoinNetwork;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -18,7 +21,8 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tracing_test::traced_test;
 
-use crate::error::APIErrorResponse;
+use crate::disk::{read_claimable_htlcs, CLAIMABLE_HTLCS_FNAME};
+use crate::error::{APIError, APIErrorResponse};
 use crate::ldk::FEE_RATE;
 use crate::routes::{
     AddressResponse, AssetBalanceRequest, AssetBalanceResponse, AssetCFA, AssetNIA, AssetUDA,
@@ -27,21 +31,26 @@ use crate::routes::{
     DecodeLNInvoiceResponse, DecodeRGBInvoiceRequest, DecodeRGBInvoiceResponse,
     DisconnectPeerRequest, EmptyResponse, FailTransfersRequest, FailTransfersResponse,
     GetAssetMediaRequest, GetAssetMediaResponse, GetChannelIdRequest, GetChannelIdResponse,
-    GetPaymentRequest, GetPaymentResponse, GetSwapRequest, GetSwapResponse, HTLCStatus,
-    InitRequest, InitResponse, InvoiceStatus, InvoiceStatusRequest, InvoiceStatusResponse,
-    IssueAssetCFARequest, IssueAssetCFAResponse, IssueAssetNIARequest, IssueAssetNIAResponse,
-    IssueAssetUDARequest, IssueAssetUDAResponse, KeysendRequest, KeysendResponse, LNInvoiceRequest,
-    LNInvoiceResponse, ListAssetsRequest, ListAssetsResponse, ListChannelsResponse,
-    ListPaymentsResponse, ListPeersResponse, ListSwapsResponse, ListTransactionsRequest,
-    ListTransactionsResponse, ListTransfersRequest, ListTransfersResponse, ListUnspentsRequest,
-    ListUnspentsResponse, MakerExecuteRequest, MakerInitRequest, MakerInitResponse,
-    NetworkInfoResponse, NodeInfoResponse, OpenChannelRequest, OpenChannelResponse, Payment, Peer,
-    PostAssetMediaResponse, Recipient, RefreshRequest, RestoreRequest, RevokeTokenRequest,
-    RgbInvoiceRequest, RgbInvoiceResponse, SendBtcRequest, SendBtcResponse, SendPaymentRequest,
-    SendPaymentResponse, SendRgbRequest, SendRgbResponse, Swap, SwapStatus, TakerRequest,
-    Transaction, Transfer, UnlockRequest, Unspent, WitnessData,
+    GetPaymentPreimageRequest, GetPaymentPreimageResponse, GetPaymentRequest, GetPaymentResponse,
+    GetSwapRequest, GetSwapResponse, HTLCStatus, InitRequest, InitResponse, InvoiceCancelRequest,
+    InvoiceHodlRequest, InvoiceHodlResponse, InvoiceSettleRequest, InvoiceStatus,
+    InvoiceStatusRequest, InvoiceStatusResponse, IssueAssetCFARequest, IssueAssetCFAResponse,
+    IssueAssetNIARequest, IssueAssetNIAResponse, IssueAssetUDARequest, IssueAssetUDAResponse,
+    KeysendRequest, KeysendResponse, LNInvoiceRequest, LNInvoiceResponse, ListAssetsRequest,
+    ListAssetsResponse, ListChannelsResponse, ListPaymentsResponse, ListPeersResponse,
+    ListSwapsResponse, ListTransactionsRequest, ListTransactionsResponse, ListTransfersRequest,
+    ListTransfersResponse, ListUnspentsRequest, ListUnspentsResponse, MakerExecuteRequest,
+    MakerInitRequest, MakerInitResponse, NetworkInfoResponse, NodeInfoResponse, OpenChannelRequest,
+    OpenChannelResponse, Payment, Peer, PostAssetMediaResponse, Recipient, RefreshRequest,
+    RestoreRequest, RevokeTokenRequest, RgbInvoiceRequest, RgbInvoiceResponse, SendBtcRequest,
+    SendBtcResponse, SendPaymentRequest, SendPaymentResponse, SendRgbRequest, SendRgbResponse,
+    Swap, SwapStatus, TakerRequest, Transaction, Transfer, UnlockRequest, Unspent, WitnessData,
+    HTLC_MIN_MSAT,
 };
-use crate::utils::{hex_str_to_vec, ELECTRUM_URL_REGTEST, PROXY_ENDPOINT_LOCAL};
+use crate::utils::{
+    hex_str, hex_str_to_vec, validate_and_parse_payment_hash, ELECTRUM_URL_REGTEST, LDK_DIR,
+    PROXY_ENDPOINT_LOCAL,
+};
 
 use super::*;
 
@@ -101,6 +110,23 @@ async fn check_response_is_nok(
     assert_eq!(api_error_response.code, expected_status.as_u16());
     assert!(api_error_response.error.contains(expected_message));
     assert_eq!(api_error_response.name, expected_name);
+}
+
+async fn post_and_check_error_response<T: Serialize>(
+    node_address: SocketAddr,
+    path: &str,
+    payload: &T,
+    expected_status: StatusCode,
+    expected_message: &str,
+    expected_name: &str,
+) {
+    let res = reqwest::Client::new()
+        .post(format!("http://{node_address}{path}"))
+        .json(payload)
+        .send()
+        .await
+        .unwrap();
+    check_response_is_nok(res, expected_status, expected_message, expected_name).await;
 }
 
 fn _fund_wallet(address: String) {
@@ -531,6 +557,27 @@ async fn get_channel_id(node_address: SocketAddr, temp_chan_id: &str) -> String 
         .channel_id
 }
 
+async fn get_payment_preimage(
+    node_address: SocketAddr,
+    payment_hash: &str,
+) -> GetPaymentPreimageResponse {
+    println!("getting payment preimage for node {node_address}");
+    let payload = GetPaymentPreimageRequest {
+        payment_hash: payment_hash.to_string(),
+    };
+    let res = reqwest::Client::new()
+        .post(format!("http://{node_address}/getpaymentpreimage"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    _check_response_is_ok(res)
+        .await
+        .json::<GetPaymentPreimageResponse>()
+        .await
+        .unwrap()
+}
+
 async fn invoice_status(node_address: SocketAddr, invoice: &str) -> InvoiceStatus {
     println!("getting status of invoice {invoice} for node {node_address}");
     let payload = InvoiceStatusRequest {
@@ -548,6 +595,63 @@ async fn invoice_status(node_address: SocketAddr, invoice: &str) -> InvoiceStatu
         .await
         .unwrap()
         .status
+}
+
+async fn invoice_hodl(
+    node_address: SocketAddr,
+    amt_msat: Option<u64>,
+    expiry_sec: u32,
+    payment_hash: String,
+    asset_id: Option<&str>,
+    asset_amount: Option<u64>,
+) -> InvoiceHodlResponse {
+    println!("creating HODL invoice on node {node_address}");
+    let payload = InvoiceHodlRequest {
+        amt_msat,
+        expiry_sec,
+        asset_id: asset_id.map(|id| id.to_string()),
+        asset_amount,
+        payment_hash,
+        external_ref: None,
+    };
+    let res = reqwest::Client::new()
+        .post(format!("http://{node_address}/hodlinvoice"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    _check_response_is_ok(res)
+        .await
+        .json::<InvoiceHodlResponse>()
+        .await
+        .unwrap()
+}
+
+async fn invoice_settle(node_address: SocketAddr, payment_hash: String, payment_preimage: String) {
+    println!("settling HODL invoice {payment_hash} on node {node_address}");
+    let payload = InvoiceSettleRequest {
+        payment_hash,
+        payment_preimage,
+    };
+    let res = reqwest::Client::new()
+        .post(format!("http://{node_address}/settlehodlinvoice"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    _check_response_is_ok(res).await;
+}
+
+async fn invoice_cancel(node_address: SocketAddr, payment_hash: String) {
+    println!("cancelling HODL invoice {payment_hash} on node {node_address}");
+    let payload = InvoiceCancelRequest { payment_hash };
+    let res = reqwest::Client::new()
+        .post(format!("http://{node_address}/cancelhodlinvoice"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    _check_response_is_ok(res).await;
 }
 
 async fn issue_asset_cfa(node_address: SocketAddr, file_path: Option<&str>) -> AssetCFA {
@@ -777,6 +881,7 @@ async fn list_payments(node_address: SocketAddr) -> Vec<Payment> {
         .unwrap()
         .payments
 }
+
 async fn get_payment(node_address: SocketAddr, payment_hash: &str) -> Payment {
     println!("getting payment for node {node_address}");
     let payload = GetPaymentRequest {
@@ -1261,6 +1366,14 @@ async fn post_asset_media(node_address: SocketAddr, file_path: &str) -> String {
         .digest
 }
 
+fn random_preimage_and_hash() -> (String, String) {
+    let mut preimage = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut preimage);
+    let preimage_hex = hex_str(&preimage);
+    let payment_hash = hex_str(&Sha256::hash(&preimage).to_byte_array());
+    (preimage_hex, payment_hash)
+}
+
 async fn refresh_transfers(node_address: SocketAddr) {
     println!("refreshing transfers for node {node_address}");
     let payload = RefreshRequest { skip_sync: false };
@@ -1471,6 +1584,17 @@ async fn send_payment_with_status(
         expected_status,
     )
     .await
+}
+
+async fn setup_single_node(
+    test_dir_base: &str,
+    node_dir: &str,
+    node_peer_port: u16,
+) -> (SocketAddr, String) {
+    let test_dir_node = format!("{test_dir_base}{node_dir}");
+    let (node_addr, _password) = start_node(&test_dir_node, node_peer_port, false).await;
+    fund_and_create_utxos(node_addr, None).await;
+    (node_addr, test_dir_node)
 }
 
 async fn shutdown(node_sockets: &[SocketAddr]) {
@@ -1824,6 +1948,7 @@ mod concurrent_btc_payments;
 mod concurrent_openchannel;
 mod fail_transfers;
 mod getchannelid;
+mod hodl_invoice;
 mod htlc_amount_checks;
 mod invoice;
 mod issue;
